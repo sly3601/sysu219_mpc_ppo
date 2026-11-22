@@ -4,3 +4,6 @@
 /run/
 /scripts/
 /training/
+/build/
+/install/
+/log/

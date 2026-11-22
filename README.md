@@ -54,7 +54,7 @@ source install/local_setup.bash
 在已加载本工作区的终端执行。
 
 ```bash
-ros2 launch sysu219_guide_controller robot_hardware.launch.py policy:=local rviz:=false
+ros2 launch sysu219_guide_controller robot_hardware.launch.py policy:=local rviz:=true
 ```
 
 入踏步时会检查 IMU 俯仰和横滚各在 ±5° 内。按 `2` 可回固定站姿。
