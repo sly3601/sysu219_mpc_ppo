@@ -4,12 +4,34 @@
 
 ## 编译
 
-在新终端进入本工程的 `ros2_ws`。现有环境使用 ONNX Runtime 1.18.1（`/opt/onnxruntime`）、ROS 2 `serial` 库（`/usr/local`）、Eigen3 和 yaml-cpp。Gazebo 还需要 Gazebo Classic、`gazebo_ros` 和 `gazebo_ros2_control`。
+在新终端进入本工程的 `ros2_ws`。现有环境使用 ONNX Runtime 1.18.1（`/opt/onnxruntime`）、ROS 2 `serial` 库（`/usr/local`）、Eigen3 和 yaml-cpp。Gazebo 还需要 Gazebo Classic、`gazebo_ros` 和 `gazebo_ros2_control`。已有这些依赖的机器可以直接编译。
 
 ```bash
 cd /home/yzz/sysu219_mpc_ppo/ros2_ws
 source /opt/ros/humble/setup.bash
+```
+
+下面两条编译命令选一条执行。克隆到其他位置时，将上面的 `cd` 改成实际路径。
+
+### 普通并行编译
+
+```bash
 colcon build \
+  --packages-up-to ocs2_core leg_pd_controller sysu219_guide_controller sysu219_description keyboard_input hardware_sysu219 \
+  --symlink-install \
+  --event-handlers console_direct+ \
+  --continue-on-error \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
+
+### 限制编译并行度
+
+沿用原工程的低负载编译方式。每次构建一个包，包内最多运行一个编译任务。
+
+```bash
+MAKEFLAGS="-j1 -l1" CMAKE_BUILD_PARALLEL_LEVEL=1 \
+colcon build \
+  --executor sequential \
   --packages-up-to ocs2_core leg_pd_controller sysu219_guide_controller sysu219_description keyboard_input hardware_sysu219 \
   --symlink-install \
   --event-handlers console_direct+ \
@@ -25,10 +47,7 @@ colcon build \
 cd /home/yzz/sysu219_mpc_ppo/ros2_ws
 source /opt/ros/humble/setup.bash
 source install/local_setup.bash
-ros2 pkg prefix sysu219_guide_controller
 ```
-
-最后一行应输出 `/home/yzz/sysu219_mpc_ppo/ros2_ws/install/sysu219_guide_controller`。
 
 ## 真机
 
