@@ -76,7 +76,10 @@ namespace sysu219_guide_controller
     bool Sysu219GuideController::updateEstimatedState(const rclcpp::Time& time, const rclcpp::Duration& period)
     {
         ctrl_component_.robot_model_->update();
-        ctrl_component_.wave_generator_->update(period.seconds());
+        if (hybrid_gait_ppo_ && current_state_ == state_list_.trotting)
+            state_list_.trotting->updateHybridGaitClock(time, period);
+        else
+            ctrl_component_.wave_generator_->update(period.seconds());
         ctrl_component_.estimator_->update();
         const bool fixed_prior = current_state_ == state_list_.fixedStand || current_state_ == state_list_.freeStand;
         if (shadow_inekf_)
@@ -442,6 +445,7 @@ namespace sysu219_guide_controller
             auto_declare<bool>("pure_gait_ppo", false);
             auto_declare<bool>("smooth_gait_ppo", false);
             auto_declare<bool>("local_gait_ppo", false);
+            auto_declare<bool>("hybrid_gait_ppo", false);
             auto_declare<bool>("gazebo_stand_only", false);
             auto_declare<bool>("mpc_ppo_foot_tracking", false);
             auto_declare<int>("rl_policy_id", 3);
@@ -518,6 +522,12 @@ namespace sysu219_guide_controller
         pure_gait_ppo_ = get_node()->get_parameter("pure_gait_ppo").as_bool();
         smooth_gait_ppo_ = get_node()->get_parameter("smooth_gait_ppo").as_bool();
         local_gait_ppo_ = get_node()->get_parameter("local_gait_ppo").as_bool();
+        hybrid_gait_ppo_ = get_node()->get_parameter("hybrid_gait_ppo").as_bool();
+        if (hybrid_gait_ppo_ && (!pure_gait_ppo_ || local_gait_ppo_ || smooth_gait_ppo_ ||
+                gazebo_stand_only_ || odometry_source_ != "inekf" || ctrl_interfaces_.frequency_ != 250)) {
+            RCLCPP_ERROR(get_node()->get_logger(), "Hybrid PPO requires its own pure gait mode, original InEKF and a 250 Hz main controller");
+            return CallbackReturn::ERROR;
+        }
         if (local_gait_ppo_ != (odometry_source_ == "none") ||
             (local_gait_ppo_ && (!pure_gait_ppo_ || smooth_gait_ppo_ || gazebo_stand_only_ ||
                                 ctrl_interfaces_.frequency_ != 250 ||
@@ -771,10 +781,10 @@ namespace sysu219_guide_controller
         state_list_.fixedStand = std::make_shared<StateFixedStand>(ctrl_interfaces_, stand_pos_, stand_kp_, stand_kd_);
         if (!gazebo_stand_only_) {
             state_list_.trotting = std::make_shared<StateTrotting>(
-                ctrl_interfaces_, ctrl_component_, pure_gait_ppo_, smooth_gait_ppo_, local_gait_ppo_);
-            if ((smooth_gait_ppo_ || local_gait_ppo_) && !state_list_.trotting->ready()) {
+                ctrl_interfaces_, ctrl_component_, pure_gait_ppo_, smooth_gait_ppo_, local_gait_ppo_, hybrid_gait_ppo_);
+            if ((smooth_gait_ppo_ || local_gait_ppo_ || hybrid_gait_ppo_) && !state_list_.trotting->ready()) {
                 RCLCPP_ERROR(get_node()->get_logger(), "Could not load the %s PPO controller",
-                             local_gait_ppo_ ? "71-input local" : "74-input smooth");
+                             hybrid_gait_ppo_ ? "74-input hybrid" : local_gait_ppo_ ? "71-input local" : "74-input smooth");
                 return CallbackReturn::ERROR;
             }
         }

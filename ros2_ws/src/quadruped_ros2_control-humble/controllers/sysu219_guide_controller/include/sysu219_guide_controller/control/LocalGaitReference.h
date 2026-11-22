@@ -15,28 +15,46 @@ public:
     }
 
     std::array<float, 26> step(const Eigen::Vector3d& command_body) {
-        const double alpha = -std::expm1(-kActorPeriod / kCommandTimeConstant);
+        const double angle = kTau * phase_ / kCycleTicks;
+        phase_ = (phase_ + kActorTicks) % kCycleTicks;
+        std::array<int, 4> next_contact{};
+        std::array<double, 4> next_phase{};
+        for (std::size_t leg = 0; leg < kFeet.size(); ++leg) {
+            const int leg_tick = (phase_ + kCycleTicks - kFeet[leg].bias) % kCycleTicks;
+            next_contact[leg] = leg_tick < kStanceTicks;
+            next_phase[leg] = next_contact[leg] ? static_cast<double>(leg_tick) / kStanceTicks
+                                               : static_cast<double>(leg_tick - kStanceTicks) / kSwingTicks;
+        }
+        return plan(command_body, angle, next_contact, next_phase, kActorPeriod);
+    }
+
+    std::array<float, 26> stepSynchronized(const Eigen::Vector3d& command_body, double current_cycle,
+                                           const std::array<int, 4>& next_contact,
+                                           const std::array<double, 4>& next_phase, double sample_interval) {
+        return plan(command_body, kTau * current_cycle, next_contact, next_phase, sample_interval);
+    }
+
+private:
+    std::array<float, 26> plan(const Eigen::Vector3d& command_body, double angle,
+                               const std::array<int, 4>& next_contact, const std::array<double, 4>& next_phase,
+                               double sample_interval) {
+        const double alpha = -std::expm1(-sample_interval / kCommandTimeConstant);
         filtered_command_ += alpha * (command_body - filtered_command_);
 
         std::array<float, 26> reference{};
-        const double angle = kTau * phase_ / kCycleTicks;
         reference[0] = static_cast<float>(std::sin(angle));
         reference[1] = static_cast<float>(std::cos(angle));
-        phase_ = (phase_ + kActorTicks) % kCycleTicks;
-
         for (std::size_t leg = 0; leg < kFeet.size(); ++leg) {
             const FootCenter& foot = kFeet[leg];
-            const int leg_tick = (phase_ + kCycleTicks - foot.bias) % kCycleTicks;
             const double vx = filtered_command_.x() - filtered_command_.z() * foot.y;
             const double vy = filtered_command_.y() + filtered_command_.z() * foot.x;
+            const double u = next_phase[leg];
             double offset, speed;
             double z = kNominalZ, vz = 0.0;
-            if (leg_tick < kStanceTicks) {
-                const double u = static_cast<double>(leg_tick) / kStanceTicks;
+            if (next_contact[leg]) {
                 offset = kStance * (0.5 - u);
                 speed = -1.0;
             } else {
-                const double u = static_cast<double>(leg_tick - kStanceTicks) / kSwingTicks;
                 const double u2 = u * u;
                 // Cubic Hermite swing joins the stance velocity at both endpoints.
                 offset = kStance * (u2 * (3.0 - 2.0 * u) - 0.5) - kSwing * (u - 3.0 * u2 + 2.0 * u2 * u);
@@ -55,7 +73,6 @@ public:
         return reference;
     }
 
-private:
     static constexpr double kTau = 6.2831853071795864769;
     static constexpr double kActorPeriod = 0.020;
     static constexpr double kCommandTimeConstant = 0.18;

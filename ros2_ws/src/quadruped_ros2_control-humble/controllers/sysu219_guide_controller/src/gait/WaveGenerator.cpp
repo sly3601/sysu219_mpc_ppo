@@ -43,6 +43,37 @@ void WaveGenerator::startTrotFromStand() {
     status_ = WaveStatus::WAVE_ALL;
 }
 
+WaveGenerator::TrotSample WaveGenerator::sampleSynchronizedTrot(std::int64_t elapsed_ns) const {
+    constexpr double nanoseconds_per_second = 1.0e9;
+    const auto period_ns = std::llround(period_ * nanoseconds_per_second);
+    const auto stance_ns = std::llround(period_ * st_ratio_ * nanoseconds_per_second);
+    const auto swing_ns = period_ns - stance_ns;
+    const auto cycle_ns = (elapsed_ns % period_ns + period_ns / 2) % period_ns;
+    TrotSample sample{};
+    sample.cycle = static_cast<double>(cycle_ns) / period_ns;
+    for (int leg = 0; leg < 4; ++leg) {
+        const auto bias_ns = std::llround(bias_(leg) * period_ns);
+        const auto leg_ns = (cycle_ns + period_ns - bias_ns) % period_ns;
+        const bool stance = leg_ns < stance_ns;
+        sample.contact[leg] = stance;
+        sample.phase[leg] = stance ? static_cast<double>(leg_ns) / stance_ns
+                                   : static_cast<double>(leg_ns - stance_ns) / swing_ns;
+    }
+    return sample;
+}
+
+void WaveGenerator::updateSynchronizedTrot(std::int64_t elapsed_ns, double control_dt) {
+    const auto sample = sampleSynchronizedTrot(elapsed_ns);
+    status_ = status_past_ = WaveStatus::WAVE_ALL;
+    switch_status_.setZero();
+    control_dt_ = control_dt;
+    control_time_ = 0.5 * period_ + static_cast<double>(elapsed_ns) * 1.0e-9;
+    for (int leg = 0; leg < 4; ++leg) {
+        contact_(leg) = sample.contact[leg];
+        phase_(leg) = sample.phase[leg];
+    }
+}
+
 auto WaveGenerator::update(const double control_dt) -> void {
     control_dt_ = std::isfinite(control_dt) && control_dt > 0.0 ? control_dt : 0.0;
     control_time_ += control_dt_;

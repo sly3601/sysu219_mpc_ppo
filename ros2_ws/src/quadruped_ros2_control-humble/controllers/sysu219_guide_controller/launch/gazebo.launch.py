@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import sysconfig
 import xml.etree.ElementTree as ET
@@ -69,6 +71,22 @@ def optional_sensor_publishers(robot, directories):
     return missing
 
 
+def require_hybrid_policy(model):
+    manifest = model.with_suffix('.json')
+    if not manifest.is_file():
+        raise RuntimeError(f'结合版 PPO 缺少导出清单：{manifest}')
+    fingerprint = 'ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825'
+    try:
+        info = json.loads(manifest.read_text(encoding='utf-8'))
+        contract = json.dumps(info['contract'], separators=(',', ':'), sort_keys=True).encode()
+        valid = (info['contract_sha256'] == hashlib.sha256(contract).hexdigest() == fingerprint
+                 and hashlib.sha256(model.read_bytes()).hexdigest() == info['onnx_sha256'])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(f'无法读取结合版 PPO 导出清单：{manifest}') from error
+    if not valid:
+        raise RuntimeError(f'结合版 PPO 策略与导出清单不匹配：{model}')
+
+
 def launch_setup(context, *args, **kwargs):
     package_description = context.launch_configurations['pkg_description']
     init_height = context.launch_configurations['height']
@@ -98,12 +116,13 @@ def launch_setup(context, *args, **kwargs):
 
     policy = context.launch_configurations['policy']
     guide_policy_args = []
-    if policy in ('pure', 'smooth', 'local', 'tracking', 'stand'):
+    if policy in ('pure', 'smooth', 'local', 'hybrid', 'tracking', 'stand'):
         model, overlay = {
             'stand': (None, 'gazebo_stand_only.yaml'),
             'pure': ('pure_gait_ppo.onnx', 'pure_gait_ppo.yaml'),
             'smooth': ('pure_smooth_gait_ppo.onnx', 'pure_smooth_gait_ppo.yaml'),
             'local': ('pure_local_gait_ppo.onnx', 'pure_local_gait_ppo.yaml'),
+            'hybrid': ('pure_hybrid_gait_ppo.onnx', 'pure_hybrid_gait_ppo.yaml'),
             'tracking': ('mpc_foot_tracker.onnx', 'mpc_tracking.yaml'),
         }[policy]
         policy_share = Path(get_package_share_directory('sysu219_guide_controller'))
@@ -113,6 +132,8 @@ def launch_setup(context, *args, **kwargs):
                 raise RuntimeError(f'策略 {policy} 尚无已导出的模型 {model}。请先完成对应任务的训练和导出。')
             if policy == 'local' and not model_path.with_suffix('.json').is_file():
                 raise RuntimeError(f'策略 {policy} 缺少模型清单：{model_path.with_suffix(".json")}')
+            if policy == 'hybrid':
+                require_hybrid_policy(model_path)
         control = root.find("./gazebo/plugin[@name='gazebo_ros2_control']")
         if control is None:
             raise RuntimeError('SYSU219 description is missing its Gazebo ROS control plugin')
@@ -120,7 +141,7 @@ def launch_setup(context, *args, **kwargs):
         if not overlay_path.is_file():
             raise RuntimeError(f'策略 {policy} 的参数文件缺失：{overlay_path}')
         ET.SubElement(control, 'parameters').text = str(overlay_path)
-        if policy in ('smooth', 'local'):
+        if policy in ('smooth', 'local', 'hybrid'):
             guide_policy_args = ['--param-file', str(overlay_path)]
 
     # The encoder system and the optional physics recorder are separate classes in one library.
@@ -353,8 +374,8 @@ def generate_launch_description():
         [
             pkg_description,
             DeclareLaunchArgument(
-                'policy', default_value='pure', choices=['pure', 'smooth', 'local', 'stand', 'flat', 'tracking'],
-                description='SYSU219 gait PPO, local PPO without odometry, standing check or MPC-backed PPO'),
+                'policy', default_value='pure', choices=['pure', 'smooth', 'local', 'hybrid', 'stand', 'flat', 'tracking'],
+                description='SYSU219 gait PPO, hybrid PPO with InEKF, standing check or MPC-backed PPO'),
             height,
             *cpu_monitor_actions(),
             DeclareLaunchArgument(

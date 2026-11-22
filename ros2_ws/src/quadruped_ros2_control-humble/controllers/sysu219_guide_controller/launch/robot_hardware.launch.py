@@ -30,6 +30,7 @@ PURE_POLICIES = {
     'pure': ('pure_gait_ppo', 'sysu219.pure_gait50.v2', 50),
     'smooth': ('pure_smooth_gait_ppo', 'sysu219.pure_gait74.v1', 74),
     'local': ('pure_local_gait_ppo', 'sysu219.pure_local_gait71.v1', 71),
+    'hybrid': ('pure_hybrid_gait_ppo', 'sysu219.pure_hybrid_gait74.v1', 74),
 }
 
 
@@ -47,6 +48,8 @@ def require_pure_policy(model_dir, kind='pure'):
                  and contract['kp'] == [260.0] * 12 and contract['kd'] == [3.8] * 12
                  and hashlib.sha256(contract_bytes).hexdigest() == info['contract_sha256']
                  and hashlib.sha256(model.read_bytes()).hexdigest() == info['onnx_sha256'])
+        if kind == 'hybrid':
+            valid = valid and info['contract_sha256'] == 'ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825'
     except (KeyError, TypeError, ValueError) as error:
         raise RuntimeError(f'无法读取纯 PPO 导出清单：{manifest}') from error
     if not valid:

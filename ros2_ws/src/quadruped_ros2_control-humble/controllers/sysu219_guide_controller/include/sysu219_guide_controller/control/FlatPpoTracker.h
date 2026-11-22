@@ -3,15 +3,17 @@
 #include "sysu219_guide_controller/control/SmoothGaitReference.h"
 
 #include <Eigen/Core>
+#include <cstdint>
 #include <memory>
 
 struct CtrlInterfaces;
+class WaveGenerator;
 
 // Construct during controller activation. Body axes: x forward, y left, z up.
 // footB columns and contacts use ROS gait leg order FR, FL, RR, RL.
 class FlatPpoTracker {
 public:
-    enum class Mode { FlatMpc, FootTrackingMpc, PureGait, SmoothGait, LocalGait };
+    enum class Mode { FlatMpc, FootTrackingMpc, PureGait, SmoothGait, LocalGait, HybridGait };
     explicit FlatPpoTracker(CtrlInterfaces& interfaces, Mode mode);
     ~FlatPpoTracker();
     static Eigen::Vector3d boundCommand(const Eigen::Vector3d& command);
@@ -26,6 +28,8 @@ public:
     bool stepSmooth(double dt, const Eigen::Vector3d& measuredVelocityBody,
                     const Eigen::Vector3d& commandBody, const SmoothGaitReference::Measurement& measurement);
     bool stepLocal(double dt, const Eigen::Vector3d& commandBody);
+    bool stepHybrid(double dt, const Eigen::Vector3d& commandBody, const Eigen::Vector3d& positionWorld,
+                    double yawWorld, std::int64_t gaitElapsedNs, const WaveGenerator& wave);
 
 private:
     struct Impl;

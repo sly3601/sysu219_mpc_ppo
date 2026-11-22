@@ -16,10 +16,11 @@ constexpr double kGaitHeight = 0.07;
 }
 
 StateTrotting::StateTrotting(CtrlInterfaces& interfaces, CtrlComponent& components, bool pure_gait,
-                             bool smooth_gait, bool local_gait)
+                             bool smooth_gait, bool local_gait, bool hybrid_gait)
     : FSMState(FSMStateName::TROTTING, "ppo_trotting", interfaces),
       components_(components), pure_gait_(pure_gait), smooth_gait_(smooth_gait), local_gait_(local_gait),
-      tracker_(interfaces, local_gait_ ? FlatPpoTracker::Mode::LocalGait :
+      hybrid_gait_(hybrid_gait), tracker_(interfaces, hybrid_gait_ ? FlatPpoTracker::Mode::HybridGait :
+          local_gait_ ? FlatPpoTracker::Mode::LocalGait :
           smooth_gait_ ? FlatPpoTracker::Mode::SmoothGait :
           pure_gait_ ? FlatPpoTracker::Mode::PureGait :
           (interfaces.node->get_parameter("mpc_ppo_foot_tracking").as_bool() ?
@@ -54,6 +55,13 @@ bool StateTrotting::jointFeedbackValid() const {
             !std::isfinite(ctrl_interfaces_.joint_velocity_state_interface_[i].get().get_value())) return false;
     }
     return true;
+}
+
+void StateTrotting::updateHybridGaitClock(const rclcpp::Time& time, const rclcpp::Duration& period) {
+    // Called before InEKF takes its joint/IMU snapshot, including the first PPO tick.
+    if (first_) hybrid_gait_start_ns_ = time.nanoseconds();
+    hybrid_gait_elapsed_ns_ = std::max<std::int64_t>(0, time.nanoseconds() - hybrid_gait_start_ns_);
+    components_.wave_generator_->updateSynchronizedTrot(hybrid_gait_elapsed_ns_, period.seconds());
 }
 
 void StateTrotting::enter() {
@@ -178,6 +186,16 @@ void StateTrotting::run(const rclcpp::Time& time, const rclcpp::Duration& period
         }
         auto& estimator = *components_.estimator_;
         auto& wave = *components_.wave_generator_;
+        if (hybrid_gait_) {
+            if (!tracker_.stepHybrid(dt, requestedVelocityBody(), estimator.getPosition(), estimator.getYaw(),
+                                     hybrid_gait_elapsed_ns_, wave)) {
+                fail("hybrid gait actor rejected synchronized phase, odometry or action");
+                return;
+            }
+            if (tracker_.didInfer()) publishTrottingActive();
+            first_ = false;
+            return;
+        }
         if (first_) wave.startTrotFromStand();
         if (pure_gait_) {
             const Vec3 velocity_world = estimator.getVelocity();

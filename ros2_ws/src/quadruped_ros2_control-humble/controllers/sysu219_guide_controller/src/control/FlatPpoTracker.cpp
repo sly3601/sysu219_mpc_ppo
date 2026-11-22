@@ -2,6 +2,7 @@
 
 #include "controller_common/CtrlInterfaces.h"
 #include "sysu219_guide_controller/control/LocalGaitReference.h"
+#include "sysu219_guide_controller/gait/WaveGenerator.h"
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <Eigen/Geometry>
 #include <onnxruntime_cxx_api.h>
@@ -18,6 +19,8 @@
 namespace {
 constexpr double kPeriod = 0.02;
 constexpr double kControllerPeriod = 0.004;
+constexpr std::int64_t kPolicyPeriodNs = 20'000'000, kControllerPeriodNs = 4'000'000;
+constexpr double kSecondsPerNanosecond = 1.0e-9;
 constexpr double kTargetTimeConstant = 0.010;
 constexpr std::array<const char*, 4> kLegs{"FL", "FR", "RL", "RR"};  // Isaac articulation order
 constexpr std::array<const char*, 3> kKinds{"hip", "thigh", "calf"};
@@ -29,10 +32,12 @@ constexpr std::array<double, 3> kGaitLow{-0.638, -0.623, -2.322}, kGaitHigh{0.74
 constexpr char kGaitContract[] = "3ab3ec864488a0d2fdab999b7ccaba431696e8c27b87a751f1a7de1ad4d0fb45";
 constexpr char kSmoothGaitContract[] = "98238c0bf8f22c9f2f9551f4a1c56e0f3881c6c56eb66bc504bbdb0fe08951d3";
 constexpr char kLocalGaitContract[] = "f099e8b4e74eaf6f0b0c2df1aeae13329ef02cab8a75904f5a619583f36bb38c";
+constexpr char kHybridGaitContract[] = "ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825";
 constexpr char kFlatCheckpoint[] = "5d16c702b3bba579830968f16c85722dbb06d75e7f1b6efd922fef3010363228";
 constexpr char kFlatContract[] = "e0f63c48ba5536a61af412bffd122f650b3a18fed27b0f3210f9465d61c8d4ba";
 constexpr char kTrackingContract[] = "930d512bfd01635766017ffa1368a462b5c42879b034827256b82d815737dd65";
 constexpr std::size_t kProprioceptionWidth = 45;  // All feedback and past actions except base linear velocity.
+constexpr std::size_t kLocalGaitWidth = kProprioceptionWidth + 26;
 
 struct PolicySpec {
     const char* model;
@@ -56,6 +61,8 @@ PolicySpec policyFor(FlatPpoTracker::Mode mode) {
             return {"pure_smooth_gait_ppo.onnx", "sysu219.pure_gait74.v1", kSmoothGaitContract, 74, true, true};
         case Mode::LocalGait:
             return {"pure_local_gait_ppo.onnx", "sysu219.pure_local_gait71.v1", kLocalGaitContract, 71, true, true};
+        case Mode::HybridGait:
+            return {"pure_hybrid_gait_ppo.onnx", "sysu219.pure_hybrid_gait74.v1", kHybridGaitContract, 74, true, true};
     }
     throw std::invalid_argument("Unknown PPO deployment mode");
 }
@@ -101,6 +108,12 @@ struct FlatPpoTracker::Impl {
         hardware_interface::LoanedStateInterface *q, *dq;
         hardware_interface::LoanedCommandInterface *pos, *vel, *effort, *kp, *kd;
     };
+    struct HybridMeasurement {
+        const Eigen::Vector3d& position;
+        double yaw;
+        std::int64_t elapsed_ns;
+        const WaveGenerator& wave;
+    };
     CtrlInterfaces& io;
     const Mode mode;
     const PolicySpec policy;
@@ -119,6 +132,10 @@ struct FlatPpoTracker::Impl {
     bool started = false, fault = false, inferred = false;
     double elapsed = 0., sinceInference = 0., blend = 0.;
     double sinceHostTick = 0.;
+    std::int64_t nextHybridPolicyNs = 0, previousHybridPolicyNs = 0;
+    std::int64_t nextHybridHostNs = 0, previousHybridHostNs = 0;
+    Eigen::Vector3d hybridPositionOrigin = Eigen::Vector3d::Zero();
+    Eigen::Vector2d hybridHeading = Eigen::Vector2d::UnitX();
     double transition, entryTolerance, entrySpeed, maxDt;
 
     Impl(CtrlInterfaces& interfaces, Mode selected)
@@ -184,11 +201,12 @@ struct FlatPpoTracker::Impl {
 
     void update(double dt, const Eigen::Vector3d* velocity, const Eigen::Vector3d& cmd,
                 const Eigen::Matrix<double, 3, 4>& feet, const Eigen::Matrix<int, 4, 1>& contact, double gaitCycle,
-                const SmoothGaitReference::Measurement* measurement = nullptr) {
+                const SmoothGaitReference::Measurement* measurement = nullptr,
+                const HybridMeasurement* hybrid = nullptr) {
         if (!std::isfinite(dt) || dt < 0. || dt > maxDt) throw std::runtime_error("Invalid control interval");
         inferred = false;
         if (dt == 0.) return;
-        const bool local = mode == Mode::LocalGait;
+        const bool local = mode == Mode::LocalGait || mode == Mode::HybridGait;
         if (!cmd.allFinite() || (!local && (!velocity || !velocity->allFinite())))
             throw std::runtime_error("Invalid policy velocity input");
         const bool smooth = mode == Mode::SmoothGait;
@@ -198,8 +216,18 @@ struct FlatPpoTracker::Impl {
                 !std::isfinite(measurement->yaw_rate_w))
                 throw std::runtime_error("Invalid estimated state for smooth PPO");
         }
+        if (mode == Mode::HybridGait && (!hybrid || !hybrid->position.allFinite() ||
+                !std::isfinite(hybrid->yaw) || hybrid->elapsed_ns < 0 ||
+                (!started && hybrid->elapsed_ns != 0) ||
+                (started && hybrid->elapsed_ns < previousHybridHostNs))) {
+            throw std::runtime_error("Invalid hybrid odometry or shared gait time");
+        }
+        double hostInterval = kControllerPeriod;
         if (policy.filtered_targets) {
-            if (started) {
+            if (hybrid && started) {
+                if (hybrid->elapsed_ns < nextHybridHostNs) return;
+                hostInterval = (hybrid->elapsed_ns - previousHybridHostNs) * kSecondsPerNanosecond;
+            } else if (started) {
                 sinceHostTick += dt;
                 if (sinceHostTick + 1.e-12 < kControllerPeriod) return;
                 // A faster caller can hold the last command between host ticks.
@@ -261,15 +289,37 @@ struct FlatPpoTracker::Impl {
             obs[48] = static_cast<float>(std::sin(phase));
             obs[49] = static_cast<float>(std::cos(phase));
         }
-        if (started) {
+        if (hybrid) {
+            elapsed = hybrid->elapsed_ns * kSecondsPerNanosecond;
+            previousHybridHostNs = hybrid->elapsed_ns;
+            nextHybridHostNs = (hybrid->elapsed_ns / kControllerPeriodNs + 1) * kControllerPeriodNs;
+        } else if (started) {
             const double tick = policy.filtered_targets ? kControllerPeriod : dt;
             elapsed += tick;
             sinceInference += tick;
         }
-        const bool inferenceDue = !started || sinceInference + 1.e-12 >= kPeriod;
+        const bool inferenceDue = hybrid ? hybrid->elapsed_ns >= nextHybridPolicyNs
+                                         : !started || sinceInference + 1.e-12 >= kPeriod;
         if (smooth && inferenceDue) {
             const auto reference = smoothReference.step(*measurement, bounded);
             std::copy(reference.begin(), reference.end(), obs.begin() + 48);
+        } else if (hybrid && inferenceDue) {
+            const auto current = hybrid->wave.sampleSynchronizedTrot(hybrid->elapsed_ns);
+            const auto next = hybrid->wave.sampleSynchronizedTrot(hybrid->elapsed_ns + kPolicyPeriodNs);
+            const double interval = started
+                ? (hybrid->elapsed_ns - previousHybridPolicyNs) * kSecondsPerNanosecond : kPeriod;
+            const auto reference = localReference.stepSynchronized(bounded, current.cycle, next.contact, next.phase, interval);
+            std::copy(reference.begin(), reference.end(), obs.begin() + kProprioceptionWidth);
+            if (!started) {
+                hybridPositionOrigin = hybrid->position;
+                hybridHeading << std::cos(hybrid->yaw), std::sin(hybrid->yaw);
+            }
+            const Eigen::Vector3d delta = hybrid->position - hybridPositionOrigin;
+            obs[kLocalGaitWidth] = static_cast<float>(hybridHeading.dot(delta.head<2>()));
+            obs[kLocalGaitWidth + 1] = static_cast<float>(-hybridHeading.y() * delta.x() + hybridHeading.x() * delta.y());
+            obs[kLocalGaitWidth + 2] = static_cast<float>(delta.z());
+            previousHybridPolicyNs = hybrid->elapsed_ns;
+            nextHybridPolicyNs = (hybrid->elapsed_ns / kPolicyPeriodNs + 1) * kPolicyPeriodNs;
         } else if (local && inferenceDue) {
             const auto reference = localReference.step(bounded);
             std::copy(reference.begin(), reference.end(), obs.begin() + kProprioceptionWidth);
@@ -292,7 +342,7 @@ struct FlatPpoTracker::Impl {
         for (std::size_t j = 0; j < joints.size(); ++j) {
             double pos = startPos[j] + blend * (goal[j] - startPos[j]);
             if (policy.filtered_targets) {
-                const double ratio = kControllerPeriod / kTargetTimeConstant;
+                const double ratio = hostInterval / kTargetTimeConstant;
                 const double decay = std::exp(-ratio);
                 const double coupling = ratio * decay;
                 const double alpha = -std::expm1(-ratio);
@@ -352,6 +402,8 @@ void FlatPpoTracker::reset() {
     impl_->fault = false;
     impl_->inferred = false;
     impl_->elapsed = impl_->sinceInference = impl_->sinceHostTick = impl_->blend = 0.;
+    impl_->nextHybridPolicyNs = impl_->previousHybridPolicyNs = 0;
+    impl_->nextHybridHostNs = impl_->previousHybridHostNs = 0;
     impl_->smoothReference.reset();
     impl_->localReference.reset();
     impl_->raw.fill(0.f);
@@ -359,7 +411,7 @@ void FlatPpoTracker::reset() {
 
 bool FlatPpoTracker::step(double dt, const Eigen::Vector3d& velocity, const Eigen::Vector3d& cmd,
                           const Eigen::Matrix<double, 3, 4>& feet, const Eigen::Matrix<int, 4, 1>& contacts, double gaitCycle) {
-    if (!ready() || impl_->mode == Mode::LocalGait) return false;
+    if (!ready() || impl_->mode == Mode::LocalGait || impl_->mode == Mode::HybridGait) return false;
     try {
         impl_->update(dt, &velocity, cmd, feet, contacts, gaitCycle);
         return true;
@@ -393,6 +445,21 @@ bool FlatPpoTracker::stepLocal(double dt, const Eigen::Vector3d& cmd) {
     } catch (const std::exception& e) {
         impl_->fault = true;
         RCLCPP_ERROR(impl_->io.node->get_logger(), "Local PPO actuator fault: %s", e.what());
+        return false;
+    }
+}
+
+bool FlatPpoTracker::stepHybrid(double dt, const Eigen::Vector3d& cmd, const Eigen::Vector3d& positionWorld,
+                               double yawWorld, std::int64_t gaitElapsedNs, const WaveGenerator& wave) {
+    if (!ready() || impl_->mode != Mode::HybridGait) return false;
+    try {
+        const Impl::HybridMeasurement measurement{positionWorld, yawWorld, gaitElapsedNs, wave};
+        impl_->update(dt, nullptr, cmd, Eigen::Matrix<double, 3, 4>::Zero(),
+                      Eigen::Matrix<int, 4, 1>::Zero(), 0., nullptr, &measurement);
+        return true;
+    } catch (const std::exception& e) {
+        impl_->fault = true;
+        RCLCPP_ERROR(impl_->io.node->get_logger(), "Hybrid PPO actuator fault: %s", e.what());
         return false;
     }
 }

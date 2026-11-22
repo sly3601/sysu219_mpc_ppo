@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -20,8 +21,9 @@
 class StateTrotting final : public FSMState {
 public:
     StateTrotting(CtrlInterfaces& interfaces, CtrlComponent& components, bool pure_gait,
-                  bool smooth_gait = false, bool local_gait = false);
+                  bool smooth_gait = false, bool local_gait = false, bool hybrid_gait = false);
     void enter() override;
+    void updateHybridGaitClock(const rclcpp::Time& time, const rclcpp::Duration& period);
     void run(const rclcpp::Time& time, const rclcpp::Duration& period) override;
     void exit() override;
     FSMStateName checkChange() override;
@@ -53,6 +55,7 @@ private:
     const bool pure_gait_;
     const bool smooth_gait_;
     const bool local_gait_;
+    const bool hybrid_gait_;
     std::unique_ptr<GaitGenerator> gait_;
     FlatPpoTracker tracker_;
     std::unique_ptr<quadruped_controller::FootMarkerPublisher> markers_;
@@ -71,6 +74,7 @@ private:
     double yaw_goal_ = 0.0, yaw_rate_goal_ = 0.0;
     double entry_height_ = 0.0, initial_height_ = 0.0, height_elapsed_ = 0.0;
     double last_plan_s_ = -1.0, last_tick_s_ = -1.0;
+    std::int64_t hybrid_gait_start_ns_ = 0, hybrid_gait_elapsed_ns_ = 0;
     RotMat rotation_;
     Vec3 gyro_, raw1_, raw2_, filtered1_, filtered2_;
     VecInt4 contact_, last_plan_contact_;

@@ -7,6 +7,7 @@
 #define WAVEGENERATOR_H
 #include <chrono>
 #include <array>
+#include <cstdint>
 #include <vector>
 #include <controller_common/common/enumClass.h>
 #include <sysu219_guide_controller/common/mathTypes.h>
@@ -19,12 +20,22 @@ inline long long getSystemTime() {
 
 class WaveGenerator {
 public:
+    struct TrotSample {
+        double cycle;
+        std::array<int, 4> contact;
+        std::array<double, 4> phase;
+    };
+
     WaveGenerator(double period, double st_ratio, const Vec4 &bias);
 
     ~WaveGenerator() = default;
 
     void startTrotFromStand();
     void update(double control_dt);
+    // Hybrid PPO uses a timestamp relative to the first trotting frame.
+    // Current and preview contacts are evaluated from the same half-cycle origin.
+    [[nodiscard]] TrotSample sampleSynchronizedTrot(std::int64_t elapsed_ns) const;
+    void updateSynchronizedTrot(std::int64_t elapsed_ns, double control_dt);
     // 第 0 行是当前接触；保持当前请求模式，在副本上推进实际切换规则。
     [[nodiscard]] std::vector<std::array<int, 4>> getMpcContactTable(
         int steps, double prediction_dt) const;
