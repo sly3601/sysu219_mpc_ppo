@@ -19,7 +19,8 @@
 
 class StateTrotting final : public FSMState {
 public:
-    StateTrotting(CtrlInterfaces& interfaces, CtrlComponent& components, bool pure_gait, bool smooth_gait = false);
+    StateTrotting(CtrlInterfaces& interfaces, CtrlComponent& components, bool pure_gait,
+                  bool smooth_gait = false, bool local_gait = false);
     void enter() override;
     void run(const rclcpp::Time& time, const rclcpp::Duration& period) override;
     void exit() override;
@@ -51,6 +52,7 @@ private:
     CtrlComponent& components_;
     const bool pure_gait_;
     const bool smooth_gait_;
+    const bool local_gait_;
     std::unique_ptr<GaitGenerator> gait_;
     FlatPpoTracker tracker_;
     std::unique_ptr<quadruped_controller::FootMarkerPublisher> markers_;

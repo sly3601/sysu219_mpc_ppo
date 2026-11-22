@@ -29,6 +29,7 @@ def local_install():
 PURE_POLICIES = {
     'pure': ('pure_gait_ppo', 'sysu219.pure_gait50.v2', 50),
     'smooth': ('pure_smooth_gait_ppo', 'sysu219.pure_gait74.v1', 74),
+    'local': ('pure_local_gait_ppo', 'sysu219.pure_local_gait71.v1', 71),
 }
 
 

@@ -155,7 +155,9 @@ namespace sysu219_guide_controller {
         bool gazebo_stand_only_ = false;
         bool pure_gait_ppo_ = false;
         bool smooth_gait_ppo_ = false;
+        bool local_gait_ppo_ = false;
         bool legacyStatesEnabled() const { return !gazebo_stand_only_ && !pure_gait_ppo_; }
+        bool updateEstimatedState(const rclcpp::Time& time, const rclcpp::Duration& period);
 
 
         std::unordered_map<

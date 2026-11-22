@@ -1,6 +1,6 @@
 # SYSU219 纯 PPO 真机与 Gazebo
 
-本工程使用 ROS 2 Humble。真机与 Gazebo 共用 74 维平滑步态策略 `policy:=smooth`。真机硬件读写沿用原工程的 500 Hz。主控按 250 Hz 读取反馈、提交 InEKF 输入并刷新关节目标，PPO 按 50 Hz 推理。
+本工程使用 ROS 2 Humble。真机和 Gazebo 共用 v3 的 71 维纯 PPO 策略 `policy:=local`。策略读取 IMU、关节反馈和本地摆足参考，运行时跳过里程计。真机硬件读写为 500 Hz，主控按 250 Hz 刷新关节目标，PPO 按 50 Hz 推理。
 
 ## 编译
 
@@ -11,7 +11,7 @@ cd /home/yzz/sysu219_mpc_ppo/ros2_ws
 source /opt/ros/humble/setup.bash
 ```
 
-下面两条编译命令选一条执行。克隆到其他位置时，将上面的 `cd` 改成实际路径。
+下面两条编译命令选一条执行。克隆到其他位置时，将上面的 `cd` 改成实际路径。从旧版升级到 v3 时，先编译本版控制器和描述包，再加载安装树。
 
 ### 普通并行编译
 
@@ -54,17 +54,17 @@ source install/local_setup.bash
 在已加载本工作区的终端执行。
 
 ```bash
-ros2 launch sysu219_guide_controller robot_hardware.launch.py policy:=smooth rviz:=false
+ros2 launch sysu219_guide_controller robot_hardware.launch.py policy:=local rviz:=false
 ```
 
-真机启动后保留原来的固定姿态切换流程。入踏步时会检查俯仰和横滚各在 ±5° 内。同次训练的早期检查点在零速仿真中出现过持续抬头，踏步运行中没有专用俯仰角退出保护。按 `2` 可回固定站姿。
+入踏步时会检查 IMU 俯仰和横滚各在 ±5° 内。按 `2` 可回固定站姿。
 
 ## Gazebo
 
 在已加载本工作区的终端执行，与真机启动命令二选一。
 
 ```bash
-ros2 launch sysu219_guide_controller gazebo.launch.py policy:=smooth
+ros2 launch sysu219_guide_controller gazebo.launch.py policy:=local
 ```
 
 ## 键盘
@@ -79,4 +79,4 @@ ros2 run keyboard_input keyboard_input
 
 ## 当前模型
 
-真机与 Gazebo 都从本工程的 `ros2_ws/install/sysu219_guide_controller/share/sysu219_guide_controller/model/` 加载 `pure_smooth_gait_ppo.onnx` 和同名 JSON。控制器启动日志会打印它加载的检查点 SHA。检查点轮次与模型校验值见 [模型清单](ros2_ws/src/quadruped_ros2_control-humble/controllers/sysu219_guide_controller/model/pure_smooth_gait_ppo.json)。
+真机和 Gazebo 都从本工程的 `ros2_ws/install/sysu219_guide_controller/share/sysu219_guide_controller/model/` 加载 `pure_local_gait_ppo.onnx` 和同名 JSON。控制器启动日志会打印检查点 SHA。训练用仿真真值计算机身稳定奖励和零指令踏步 10 秒的漂移指标。检查点轮次和文件校验值见 [模型清单](ros2_ws/src/quadruped_ros2_control-humble/controllers/sysu219_guide_controller/model/pure_local_gait_ppo.json)。

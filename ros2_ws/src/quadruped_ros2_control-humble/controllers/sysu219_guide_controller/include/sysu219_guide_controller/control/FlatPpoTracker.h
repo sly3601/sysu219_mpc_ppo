@@ -11,7 +11,7 @@ struct CtrlInterfaces;
 // footB columns and contacts use ROS gait leg order FR, FL, RR, RL.
 class FlatPpoTracker {
 public:
-    enum class Mode { FlatMpc, FootTrackingMpc, PureGait, SmoothGait };
+    enum class Mode { FlatMpc, FootTrackingMpc, PureGait, SmoothGait, LocalGait };
     explicit FlatPpoTracker(CtrlInterfaces& interfaces, Mode mode);
     ~FlatPpoTracker();
     static Eigen::Vector3d boundCommand(const Eigen::Vector3d& command);
@@ -25,6 +25,7 @@ public:
               const Eigen::Matrix<int, 4, 1>& contacts, double gaitCycle = 0.0);
     bool stepSmooth(double dt, const Eigen::Vector3d& measuredVelocityBody,
                     const Eigen::Vector3d& commandBody, const SmoothGaitReference::Measurement& measurement);
+    bool stepLocal(double dt, const Eigen::Vector3d& commandBody);
 
 private:
     struct Impl;

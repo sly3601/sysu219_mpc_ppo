@@ -98,16 +98,21 @@ def launch_setup(context, *args, **kwargs):
 
     policy = context.launch_configurations['policy']
     guide_policy_args = []
-    if policy in ('pure', 'smooth', 'tracking', 'stand'):
+    if policy in ('pure', 'smooth', 'local', 'tracking', 'stand'):
         model, overlay = {
             'stand': (None, 'gazebo_stand_only.yaml'),
             'pure': ('pure_gait_ppo.onnx', 'pure_gait_ppo.yaml'),
             'smooth': ('pure_smooth_gait_ppo.onnx', 'pure_smooth_gait_ppo.yaml'),
+            'local': ('pure_local_gait_ppo.onnx', 'pure_local_gait_ppo.yaml'),
             'tracking': ('mpc_foot_tracker.onnx', 'mpc_tracking.yaml'),
         }[policy]
         policy_share = Path(get_package_share_directory('sysu219_guide_controller'))
-        if model and not (policy_share / 'model' / model).is_file():
-            raise RuntimeError(f'策略 {policy} 尚无已导出的模型 {model}。请先完成对应任务的训练和导出。')
+        if model:
+            model_path = policy_share / 'model' / model
+            if not model_path.is_file():
+                raise RuntimeError(f'策略 {policy} 尚无已导出的模型 {model}。请先完成对应任务的训练和导出。')
+            if policy == 'local' and not model_path.with_suffix('.json').is_file():
+                raise RuntimeError(f'策略 {policy} 缺少模型清单：{model_path.with_suffix(".json")}')
         control = root.find("./gazebo/plugin[@name='gazebo_ros2_control']")
         if control is None:
             raise RuntimeError('SYSU219 description is missing its Gazebo ROS control plugin')
@@ -115,7 +120,7 @@ def launch_setup(context, *args, **kwargs):
         if not overlay_path.is_file():
             raise RuntimeError(f'策略 {policy} 的参数文件缺失：{overlay_path}')
         ET.SubElement(control, 'parameters').text = str(overlay_path)
-        if policy == 'smooth':
+        if policy in ('smooth', 'local'):
             guide_policy_args = ['--param-file', str(overlay_path)]
 
     # The encoder system and the optional physics recorder are separate classes in one library.
@@ -348,8 +353,8 @@ def generate_launch_description():
         [
             pkg_description,
             DeclareLaunchArgument(
-                'policy', default_value='pure', choices=['pure', 'smooth', 'stand', 'flat', 'tracking'],
-                description='SYSU219 pure gait PPO, 74-input smooth PPO, standing check or MPC-backed PPO'),
+                'policy', default_value='pure', choices=['pure', 'smooth', 'local', 'stand', 'flat', 'tracking'],
+                description='SYSU219 gait PPO, local PPO without odometry, standing check or MPC-backed PPO'),
             height,
             *cpu_monitor_actions(),
             DeclareLaunchArgument(

@@ -15,10 +15,12 @@ constexpr double kMaxPlanAge = 0.020;       // one policy interval
 constexpr double kGaitHeight = 0.07;
 }
 
-StateTrotting::StateTrotting(CtrlInterfaces& interfaces, CtrlComponent& components, bool pure_gait, bool smooth_gait)
+StateTrotting::StateTrotting(CtrlInterfaces& interfaces, CtrlComponent& components, bool pure_gait,
+                             bool smooth_gait, bool local_gait)
     : FSMState(FSMStateName::TROTTING, "ppo_trotting", interfaces),
-      components_(components), pure_gait_(pure_gait), smooth_gait_(smooth_gait),
-      tracker_(interfaces, smooth_gait_ ? FlatPpoTracker::Mode::SmoothGait :
+      components_(components), pure_gait_(pure_gait), smooth_gait_(smooth_gait), local_gait_(local_gait),
+      tracker_(interfaces, local_gait_ ? FlatPpoTracker::Mode::LocalGait :
+          smooth_gait_ ? FlatPpoTracker::Mode::SmoothGait :
           pure_gait_ ? FlatPpoTracker::Mode::PureGait :
           (interfaces.node->get_parameter("mpc_ppo_foot_tracking").as_bool() ?
                FlatPpoTracker::Mode::FootTrackingMpc : FlatPpoTracker::Mode::FlatMpc)),
@@ -67,6 +69,7 @@ void StateTrotting::enter() {
         fail("actor or joint feedback unavailable at entry");
         return;
     }
+    if (local_gait_) return;
     components_.wave_generator_->status_ = WaveStatus::STANCE_ALL;
     if (pure_gait_) return;
     if (!components_.convex_mpc_) {
@@ -164,6 +167,15 @@ void StateTrotting::run(const rclcpp::Time& time, const rclcpp::Duration& period
             return;
         }
         last_tick_s_ = now;
+        if (local_gait_) {
+            if (!tracker_.stepLocal(dt, requestedVelocityBody())) {
+                fail("local gait actor rejected feedback or action");
+                return;
+            }
+            if (tracker_.didInfer()) publishTrottingActive();
+            first_ = false;
+            return;
+        }
         auto& estimator = *components_.estimator_;
         auto& wave = *components_.wave_generator_;
         if (first_) wave.startTrotFromStand();
@@ -274,7 +286,7 @@ void StateTrotting::fail(const char* reason) {
 
 void StateTrotting::exit() {
     tracker_.reset();
-    components_.wave_generator_->status_ = WaveStatus::STANCE_ALL;
+    if (!local_gait_) components_.wave_generator_->status_ = WaveStatus::STANCE_ALL;
 }
 
 FSMStateName StateTrotting::checkChange() {

@@ -1,0 +1,14 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 250
+
+sysu219_guide_controller:
+  ros__parameters:
+    update_rate: 250
+    pure_gait_ppo: true
+    local_gait_ppo: true
+    odometry_source: 'none'
+    shadow_inekf_enabled: false
+    contact_feedback_control: false
+    contact_shadow_inekf_enabled: false
+    contact_shadow_write_csv: false

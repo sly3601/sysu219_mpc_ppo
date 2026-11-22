@@ -73,14 +73,8 @@ namespace sysu219_guide_controller
         return conf;
     }
 
-    controller_interface::return_type Sysu219GuideController::
-    update(const rclcpp::Time& time, const rclcpp::Duration& period)
+    bool Sysu219GuideController::updateEstimatedState(const rclcpp::Time& time, const rclcpp::Duration& period)
     {
-        if (ctrl_component_.robot_model_ == nullptr)
-        {
-            return controller_interface::return_type::OK;
-        }
-
         ctrl_component_.robot_model_->update();
         ctrl_component_.wave_generator_->update(period.seconds());
         ctrl_component_.estimator_->update();
@@ -229,6 +223,17 @@ namespace sysu219_guide_controller
             ctrl_interfaces_.body_debug_pub->publish(msg);
         }
 
+        return odometry_ready;
+    }
+
+    controller_interface::return_type Sysu219GuideController::
+    update(const rclcpp::Time& time, const rclcpp::Duration& period)
+    {
+        if (!local_gait_ppo_ && !ctrl_component_.robot_model_)
+            return controller_interface::return_type::OK;
+
+        const bool odometry_ready = local_gait_ppo_ || updateEstimatedState(time, period);
+
         // 2026.04.28关键修改：把状态机的更新放在最后，否则会漏掉一拍新状态
         if (mode_ == FSMMode::NORMAL)
         {
@@ -296,12 +301,15 @@ namespace sysu219_guide_controller
                 next_state_name_ = current_state_->state_name;
             }
             bool reject_trotting = false;
-            if (next_state_ == state_list_.trotting)
+            if (!reject_imu && next_state_ == state_list_.trotting)
             {
                 // 进入前按相对零度的绝对角度检查，不能把过大的倾斜锁成目标姿态。
                 constexpr double trotting_entry_tilt_limit_deg = 5.0;
                 constexpr double rad_to_deg = 180.0 / M_PI;
-                const Vec3 entry_rpy = rotMatToRPY(ctrl_component_.estimator_->getRotation());
+                const RotMat entry_rotation = local_gait_ppo_
+                    ? Eigen::Quaterniond(iw, ix, iy, iz).normalized().toRotationMatrix()
+                    : ctrl_component_.estimator_->getRotation();
+                const Vec3 entry_rpy = rotMatToRPY(entry_rotation);
                 const bool contact_not_ready = ctrl_component_.contact_feedback_enabled &&
                     (!ctrl_component_.contact_observation_ready ||
                      ctrl_component_.contact_observation.contact != std::array<int, 4>{{1, 1, 1, 1}});
@@ -352,7 +360,8 @@ namespace sysu219_guide_controller
             current_state_->exit(); current_state_ = next_state_ = stop_state;
             next_state_name_ = current_state_->state_name; mode_ = FSMMode::NORMAL;
             current_state_->enter(); current_state_->run(time, period);
-            RCLCPP_ERROR(get_node()->get_logger(), "[MPC_PPO] tracking stopped; command replaced by %s",
+            RCLCPP_ERROR(get_node()->get_logger(), "%s command replaced by %s",
+                local_gait_ppo_ ? "[PPO_TROTTING]" : "[MPC_PPO] tracking stopped;",
                 current_state_->state_name_string.c_str());
         }
         // ========== 发布关节目标位置（cmd_pos）镜像到 /joint_cmd_states ==========
@@ -368,7 +377,7 @@ namespace sysu219_guide_controller
         }
 
         // 仿真诊断：所有 FSM 状态都可采集；50 Hz，无订阅者时不组装消息。
-        if (quadruped_debug::Csv_DebugMode && estimator_debug_pub_ &&
+        if (!local_gait_ppo_ && quadruped_debug::Csv_DebugMode && estimator_debug_pub_ &&
             estimator_debug_pub_->get_subscription_count() > 0 &&
             (last_estimator_debug_s_ < 0.0 || time.seconds() < last_estimator_debug_s_ ||
              time.seconds() - last_estimator_debug_s_ >= 0.02 - 1e-9)) {
@@ -432,6 +441,7 @@ namespace sysu219_guide_controller
             // RLWALK: 1=AR002, 2=AR003, 3=AR002/8ms delay. Legacy models are disabled.
             auto_declare<bool>("pure_gait_ppo", false);
             auto_declare<bool>("smooth_gait_ppo", false);
+            auto_declare<bool>("local_gait_ppo", false);
             auto_declare<bool>("gazebo_stand_only", false);
             auto_declare<bool>("mpc_ppo_foot_tracking", false);
             auto_declare<int>("rl_policy_id", 3);
@@ -464,8 +474,6 @@ namespace sysu219_guide_controller
 
             get_node()->get_parameter("update_rate", ctrl_interfaces_.frequency_);
             RCLCPP_INFO(get_node()->get_logger(), "Controller Manager Update Rate: %d Hz", ctrl_interfaces_.frequency_);
-
-            ctrl_component_.estimator_ = std::make_shared<Estimator>(ctrl_interfaces_, ctrl_component_);
         }
         catch (const std::exception& e)
         {
@@ -495,8 +503,9 @@ namespace sysu219_guide_controller
         const rclcpp_lifecycle::State& /*previous_state*/)
     {
         odometry_source_ = get_node()->get_parameter("odometry_source").as_string();
-        if (odometry_source_ != "legacy_kf" && odometry_source_ != "inekf" && odometry_source_ != "contact_inekf") {
-            RCLCPP_ERROR(get_node()->get_logger(), "odometry_source只能为legacy_kf / inekf / contact_inekf");
+        if (odometry_source_ != "legacy_kf" && odometry_source_ != "inekf" &&
+            odometry_source_ != "contact_inekf" && odometry_source_ != "none") {
+            RCLCPP_ERROR(get_node()->get_logger(), "Invalid odometry_source: %s", odometry_source_.c_str());
             return CallbackReturn::ERROR;
         }
 #ifndef SYSU219_ENABLE_CONTACT_SHADOW
@@ -505,12 +514,22 @@ namespace sysu219_guide_controller
             return CallbackReturn::ERROR;
         }
 #endif
-        ctrl_component_.odometry_mode = odometry_source_ == "legacy_kf" ? 0 : odometry_source_ == "inekf" ? 1 : 2;
-        ctrl_component_.contact_feedback_enabled = ctrl_component_.odometry_mode == 2 &&
-            get_node()->get_parameter("contact_feedback_control").as_bool();
         gazebo_stand_only_ = get_node()->get_parameter("gazebo_stand_only").as_bool();
         pure_gait_ppo_ = get_node()->get_parameter("pure_gait_ppo").as_bool();
         smooth_gait_ppo_ = get_node()->get_parameter("smooth_gait_ppo").as_bool();
+        local_gait_ppo_ = get_node()->get_parameter("local_gait_ppo").as_bool();
+        if (local_gait_ppo_ != (odometry_source_ == "none") ||
+            (local_gait_ppo_ && (!pure_gait_ppo_ || smooth_gait_ppo_ || gazebo_stand_only_ ||
+                                ctrl_interfaces_.frequency_ != 250 ||
+                                get_node()->get_parameter("contact_feedback_control").as_bool()))) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                "Only local PPO uses odometry_source=none. Local PPO requires pure gait, 250 Hz and contact feedback disabled.");
+            return CallbackReturn::ERROR;
+        }
+        ctrl_component_.odometry_mode = local_gait_ppo_ ? -1 :
+            (odometry_source_ == "legacy_kf" ? 0 : odometry_source_ == "inekf" ? 1 : 2);
+        ctrl_component_.contact_feedback_enabled = ctrl_component_.odometry_mode == 2 &&
+            get_node()->get_parameter("contact_feedback_control").as_bool();
         if (smooth_gait_ppo_ && (!pure_gait_ppo_ || gazebo_stand_only_ || odometry_source_ != "inekf"
                 || ctrl_interfaces_.frequency_ != 250)) {
             RCLCPP_ERROR(get_node()->get_logger(), "Smooth PPO requires pure gait mode, InEKF and a 250 Hz main controller");
@@ -522,12 +541,25 @@ namespace sysu219_guide_controller
         }
         ctrl_component_.convex_mpc_.reset();
         ctrl_component_.balance_ctrl_.reset();
+        robot_description_subscription_.reset();
+        ctrl_component_.estimator_.reset();
+        ctrl_component_.robot_model_.reset();
+        ctrl_component_.wave_generator_.reset();
+        if (!local_gait_ppo_) {
+            try {
+                ctrl_component_.estimator_ = std::make_shared<Estimator>(ctrl_interfaces_, ctrl_component_);
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(get_node()->get_logger(), "Estimator initialization failed: %s", e.what());
+                return CallbackReturn::ERROR;
+            }
+        }
         if (legacyStatesEnabled()) {
             ctrl_component_.convex_mpc_ = std::make_shared<ConvexMpcSolver>();
         }
         // 可选影子观测器：初始化失败时仅停用该模块，主控制器继续运行。
         shadow_inekf_.reset();
-        if (ctrl_component_.odometry_mode == 1 || get_node()->get_parameter("shadow_inekf_enabled").as_bool()) {
+        if (!local_gait_ppo_ && (ctrl_component_.odometry_mode == 1 ||
+            get_node()->get_parameter("shadow_inekf_enabled").as_bool())) {
             try {
                 shadow_inekf_ = std::make_shared<ShadowInEKF>(
                     joint_names_, feet_names_, base_name_, imu_name_);
@@ -538,7 +570,8 @@ namespace sysu219_guide_controller
         contact_shadow_inekf_.reset();
 #ifdef SYSU219_ENABLE_CONTACT_SHADOW
         try {
-            if (ctrl_component_.odometry_mode == 2 || get_node()->get_parameter("contact_shadow_inekf_enabled").as_bool()) {
+            if (!local_gait_ppo_ && (ctrl_component_.odometry_mode == 2 ||
+                get_node()->get_parameter("contact_shadow_inekf_enabled").as_bool())) {
                 ContactShadowInEKF::Settings settings;
                 settings.serve_odometry = ctrl_component_.odometry_mode == 2;
                 settings.force_on_N = get_node()->get_parameter("contact_shadow_force_on_N").as_double();
@@ -572,6 +605,8 @@ namespace sysu219_guide_controller
                 ctrl_interfaces_.control_inputs_.rx = msg->rx;
                 ctrl_interfaces_.control_inputs_.ry = msg->ry;
             });
+
+        if (local_gait_ppo_) return CallbackReturn::SUCCESS;
 
         robot_description_subscription_ = get_node()->create_subscription<std_msgs::msg::String>(
             "/robot_description", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local(),
@@ -623,9 +658,13 @@ namespace sysu219_guide_controller
             com_estimated_pub_ = get_node()->create_publisher<geometry_msgs::msg::PointStamped>(
                 "/com_estimated", rclcpp::QoS(1));
         }
-        ctrl_interfaces_.body_debug_pub = ctrl_interfaces_.node->create_publisher<std_msgs::msg::Float64MultiArray>("/body_debug", 10);
+        ctrl_interfaces_.body_debug_pub.reset();
+        tf_broadcaster_.reset();
+        if (!local_gait_ppo_) {
+            ctrl_interfaces_.body_debug_pub = ctrl_interfaces_.node->create_publisher<std_msgs::msg::Float64MultiArray>("/body_debug", 10);
+            tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(get_node());
+        }
         joint_cmd_pub_ = ctrl_interfaces_.node->create_publisher<sensor_msgs::msg::JointState>("/joint_cmd_states", 10);
-        tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(get_node());
         // clear out vectors in case of restart
         ctrl_interfaces_.clear();
 
@@ -701,7 +740,7 @@ namespace sysu219_guide_controller
         }
 
         // Create FSM List
-        ctrl_component_.estimator_->selectInEKF(ctrl_component_.odometry_mode != 0);
+        if (!local_gait_ppo_) ctrl_component_.estimator_->selectInEKF(ctrl_component_.odometry_mode != 0);
         last_odometry_ready_ = false;
         ctrl_component_.contact_observation_ready = false;
         if (shadow_inekf_) {
@@ -732,9 +771,10 @@ namespace sysu219_guide_controller
         state_list_.fixedStand = std::make_shared<StateFixedStand>(ctrl_interfaces_, stand_pos_, stand_kp_, stand_kd_);
         if (!gazebo_stand_only_) {
             state_list_.trotting = std::make_shared<StateTrotting>(
-                ctrl_interfaces_, ctrl_component_, pure_gait_ppo_, smooth_gait_ppo_);
-            if (smooth_gait_ppo_ && !state_list_.trotting->ready()) {
-                RCLCPP_ERROR(get_node()->get_logger(), "Could not load the 74-input smooth PPO controller");
+                ctrl_interfaces_, ctrl_component_, pure_gait_ppo_, smooth_gait_ppo_, local_gait_ppo_);
+            if ((smooth_gait_ppo_ || local_gait_ppo_) && !state_list_.trotting->ready()) {
+                RCLCPP_ERROR(get_node()->get_logger(), "Could not load the %s PPO controller",
+                             local_gait_ppo_ ? "71-input local" : "74-input smooth");
                 return CallbackReturn::ERROR;
             }
         }
