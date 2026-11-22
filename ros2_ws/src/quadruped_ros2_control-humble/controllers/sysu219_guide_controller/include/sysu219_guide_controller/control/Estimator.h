@@ -1,0 +1,204 @@
+//
+// Created by biao on 24-9-14.
+//
+
+#ifndef ESTIMATOR_H
+#define ESTIMATOR_H
+#include <memory>
+#include <kdl/frames.hpp>
+#include <sysu219_guide_controller/common/mathTypes.h>
+#include <sysu219_guide_controller/robot/QuadrupedRobot.h>
+#include "LowPassFilter.h"
+#include "ShadowInEKF.hpp"
+
+struct CtrlInterfaces;
+class WaveGenerator;
+class QuadrupedRobot;
+struct CtrlComponent;
+
+class Estimator {
+public:
+    explicit Estimator(CtrlInterfaces &ctrl_interfaces, CtrlComponent &ctrl_component);
+
+    ~Estimator() = default;
+
+    /**
+     * Get the estimated robot central position
+     * @return robot central position
+     */
+    Vec3 getPosition() const {
+        if (use_inekf_) return inekf_position_;
+        return x_hat_.segment(0, 3);
+    }
+
+    /**
+     * Get the estimated robot central velocity
+     * @return robot central velocity
+     */
+    Vec3 getVelocity() const {    // 从状态向量x_hat_的第3个元素开始，截取3个元素（即速度部分）
+        if (use_inekf_) return inekf_velocity_;
+        return x_hat_.segment(3, 3); // 机身在世界坐标系下的线速度
+    }
+
+    /**
+     * Get the estimated foot position in world frame
+     * @param index leg index
+     * @return foot position in world frame
+     */
+    Vec3 getFootPos(const int index) {
+        return getPosition() + getRotation() * Vec3(foot_poses_[index].p.data);
+    }
+
+    /**
+     * Get the estimated feet velocity in world frame
+     * @return feet velocity in world frame
+     */
+    Vec34 getFeetPos() {  // 返回足底在世界系下的位置
+        Vec34 feet_pos;
+        for (int i(0); i < 4; ++i) {
+            feet_pos.col(i) = getFootPos(i);
+        }
+        return feet_pos;
+    }
+
+    /**
+     * Get the estimated feet velocity in world frame
+     * @return feet velocity in world frame
+     */
+    Vec34 getFeetVel() { // 
+        const std::vector<KDL::Vector> feet_vel = robot_model_->getFeet2BVelocities();// 先获取身体坐标系下的足底速度
+        Vec34 result;
+        for (int i(0); i < 4; ++i) {
+            const Vec3 foot_pos_B(foot_poses_[i].p.data);
+            // v_foot_G = v_body_G + R_B2G * (J * qd + omega_B x r_B)
+            result.col(i) = getRotation() * (Vec3(feet_vel[i].data) + getGyro().cross(foot_pos_B))
+                            + getVelocity();
+        }
+        return result;
+    }
+
+    /**
+     * Get the estimated foot position in body frame
+     * @return
+     */
+    Vec34 getFeetPos2Body() {
+        Vec34 foot_pos;
+        const Vec3 body_pos = getPosition();
+        for (int i = 0; i < 4; i++) {
+            foot_pos.col(i) = getFootPos(i) - body_pos;
+        }
+        return foot_pos;
+    }
+
+    RotMat getRotation() const {
+        return use_inekf_ ? inekf_rotation_ : rotation_;
+    }
+
+    Vec3 getGyro() const {
+        return use_inekf_ ? inekf_gyro_ : gyro_;
+    }
+
+    //  getGyro()：机身坐标系角速度；旧 KF 使用原值，InEKF 使用去零偏后的值。
+    //  getGyroGlobal()：使用同一来源的姿态转换到世界坐标系。
+    [[nodiscard]] Vec3 getGyroGlobal() const {
+        return getRotation() * getGyro();
+    }
+
+    [[nodiscard]] double getYaw() const;
+
+    [[nodiscard]] double getDYaw() const {
+        return getGyroGlobal()(2);
+    }
+
+    void update();
+
+    // 由 odometry_source 配置在激活时选定；新系统未就绪时不自动改用旧 KF。
+    void selectInEKF(bool enabled) {
+        use_inekf_ = enabled;
+        if (!enabled) inekf_control_debug_ = sysu219_guide_controller::ShadowInEKF::ControlDebug{};
+    }
+    // 与本拍实际供给控制的InEKF结果同步；只用于CSV诊断，不参与控制决策。
+    const sysu219_guide_controller::ShadowInEKF::ControlDebug& debugInEKFControl() const noexcept {
+        return inekf_control_debug_;
+    }
+    void setInEKFControlDebug(const sysu219_guide_controller::ShadowInEKF::ControlDebug& debug) noexcept {
+        inekf_control_debug_ = debug;
+    }
+    // 只供对照发布读取旧 KF，避免显示链误把选定的新输出当作旧估计。
+    void legacyState(Vec3& position, Vec3& velocity, RotMat& rotation) const {
+        position = x_hat_.segment<3>(0); velocity = x_hat_.segment<3>(3); rotation = rotation_;
+    }
+
+    // 只写入新系统的缓存输出，不改变来源选择或旧 KF 的状态、协方差及低通滤波器。
+    void useInEKFState(const Vec3& position, const Vec3& velocity,
+                      const RotMat& rotation, const Vec3& gyro) {
+        inekf_position_ = position; inekf_velocity_ = velocity;
+        inekf_rotation_ = rotation; inekf_gyro_ = gyro;
+    }
+    // 仅诊断：始终为旧 KF 的预测速度、低通前速度及去重力加速度，不用于控制切换。
+    const Vec3& debugVelocityPredicted() const { return debug_v_predicted_; }
+    const Vec3& debugVelocityUnfiltered() const { return debug_v_unfiltered_; }
+    const Vec3& debugAcceleration() const { return u_; }
+    double debugDt() const { return dt_; }
+
+private:
+    bool use_inekf_ = false;
+    sysu219_guide_controller::ShadowInEKF::ControlDebug inekf_control_debug_;
+    Vec3 inekf_position_ = Vec3::Zero(), inekf_velocity_ = Vec3::Zero(), inekf_gyro_ = Vec3::Zero();
+    RotMat inekf_rotation_ = RotMat::Identity();
+    Vec3 debug_v_predicted_ = Vec3::Zero(), debug_v_unfiltered_ = Vec3::Zero();
+    CtrlInterfaces &ctrl_interfaces_;
+    std::shared_ptr<QuadrupedRobot> &robot_model_;
+    std::shared_ptr<WaveGenerator> &wave_generator_;
+
+    // 18维状态向量：[质心位置(3) + 质心速度(3) + 4条足端位置(3×4)]
+    Eigen::Matrix<double, 18, 1> x_hat_; // The state of estimator, position(3)+velocity(3)+feet position(3x4)
+
+    Eigen::Matrix<double, 3, 1> u_; // The input of estimator
+
+    Eigen::Matrix<double, 28, 1> y_; // The measurement value of output y
+    Eigen::Matrix<double, 28, 1> y_hat_; // The prediction of output y
+    Eigen::Matrix<double, 18, 18> A; // The transtion matrix of estimator
+    Eigen::Matrix<double, 18, 3> B; // The input matrix
+    Eigen::Matrix<double, 28, 18> C; // The output matrix
+
+    // Covariance Matrix
+    Eigen::Matrix<double, 18, 18> P; // Prediction covariance
+    Eigen::Matrix<double, 18, 18> Ppriori; // Priori prediction covariance
+    Eigen::Matrix<double, 18, 18> Q; // Dynamic simulation covariance
+    Eigen::Matrix<double, 28, 28> R; // Measurement covariance
+    Eigen::Matrix<double, 18, 18> QInit_; // Initial value of Dynamic simulation covariance
+    Eigen::Matrix<double, 28, 28> RInit_; // Initial value of Measurement covariance
+    Eigen::Matrix<double, 18, 1> Qdig; // adjustable process noise covariance 
+    // dig：大概率是作者随手写的 diag / diagonal 缩写
+    Eigen::Matrix<double, 3, 3> Cu; // The covariance of system input u
+
+    // Output Measurement
+    Eigen::Matrix<double, 12, 1> feet_pos_body_; // The feet positions to body, in the global coordinate
+    Eigen::Matrix<double, 12, 1> feet_vel_body_; // The feet velocity to body, in the global coordinate
+    Eigen::Matrix<double, 4, 1> feet_h_; // The Height of each foot, in the global coordinate
+
+    Eigen::Matrix<double, 28, 28> S; // _S = C*P*C.T + R
+    Eigen::PartialPivLU<Eigen::Matrix<double, 28, 28> > Slu; // _S.lu()
+    Eigen::Matrix<double, 28, 1> Sy; // _Sy = _S.inv() * (y - yhat)
+    Eigen::Matrix<double, 28, 18> Sc; // _Sc = _S.inv() * C
+    Eigen::Matrix<double, 28, 28> SR; // _SR = _S.inv() * R
+    Eigen::Matrix<double, 28, 18> STC; // _STC = (_S.transpose()).inv() * C
+    Eigen::Matrix<double, 18, 18> IKC; // _IKC = I - KC
+
+    Vec3 g_;
+    double dt_;
+
+    RotMat rotation_;
+    Vec3 acceleration_;
+    Vec3 gyro_;
+
+    std::vector<KDL::Frame> foot_poses_;
+    std::vector<KDL::Vector> foot_vels_;
+    std::vector<std::shared_ptr<LowPassFilter> > low_pass_filters_;
+
+    double large_variance_;
+};
+
+
+#endif //ESTIMATOR_H

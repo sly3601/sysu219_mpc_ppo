@@ -1,0 +1,142 @@
+#pragma once
+
+#include <array>
+#include <memory>
+#include <vector>
+
+#include <sysu219_guide_controller/common/mathTypes.h>
+
+// 论文标准 MPC 状态：
+// x = [Theta(3), p_com(3), omega(3), v_com(3), g_z(1)]
+// 总维度 = 13
+using Vec13 = Eigen::Matrix<double, 13, 1>;
+using Mat13 = Eigen::Matrix<double, 13, 13>;
+using Mat1312 = Eigen::Matrix<double, 13, 12>;
+
+// MPC 输入：不再强制使用 OCS2 类型
+// ConvexMpcInput 是 solveMpc() 的直接输入。
+// 这里的数据应该在 solveFromDogWrench() 里提前构造好。
+struct ConvexMpcInput {
+  int N = 0;                                // 当前实际 MPC horizon steps，经过计算得到最终的实际步数
+  double dt = 0.0;                          // dt = delta time，离散时间步长，单位 s。
+  Vec13 x0 = Vec13::Zero();                 // x0 = initial state，当前初始状态。
+  std::vector<Vec13> xRef;                  // xRef = reference state trajectory，参考状态轨迹，即论文中的D
+  std::vector<std::array<int, 4>> contact;  // contact[k][leg] 表示第 k 个预测步第 leg 条腿是否支撑。顺序是 FR, FL, RR, RL，1 支撑，0 摆动。
+  std::vector<std::array<Vec3, 4>> rFeet;   // 力臂r
+  Mat3 Iw_inv = Mat3::Identity();           // 世界系下的机身转动惯量逆矩阵
+  Vec4 liftoff_fz_limit = Vec4::Constant(1e19); // 当前控制帧的抬脚前卸载上限。
+  std::vector<Vec4> stage_force_limits; // 可选：闭环交接逐节点的法向力上限，N；空表示原行为。
+  std::vector<Vec4> stage_force_minimum; // 可选：仅限力预加载阶段的法向力下限。
+};
+
+// MPC 输出
+struct ConvexMpcOutput {
+  Vec12 u0 = Vec12::Zero(); // 12x1: [f_FR, f_FL, f_RR, f_RL]
+  bool success = false;
+};
+
+class ConvexMpcSolver {
+public:
+  explicit ConvexMpcSolver();
+  ~ConvexMpcSolver();
+
+  void reset();
+  // 仅初始化时读取实际权重；在线写入仅由主控制线程完成。
+  const Mat13& stateWeights() const noexcept { return Q; }
+  const Mat12& forceWeights() const noexcept { return R; }
+  const Mat12& forceRateWeights() const noexcept { return S; }
+  // 输入已经过调参后台校验；原地更新现有代价缓存，无分配/重建/求解器重置。
+  // 返回是否发生改变，供主控制线程决定本周期是否需要立即重新求解。
+  [[nodiscard]] bool updateCostWeights(const Mat13& q, const Mat12& r, const Mat12& s) noexcept;
+  const Vec3& comOffsetBody() const { return pcb_B; }
+  // WBC松弛优化读取同一组力界，避免两级优化使用不同摩擦参数。
+  double frictionCoefficient() const { return mu; }
+  double normalForceMin() const { return fzMin; }
+  double normalForceMax() const { return fzMax; }
+  double nominalWeight() const { return mass * 9.81; }
+  struct DebugInfo {
+    size_t id = 0;
+    int status = -1, iter = -1, result = -1; // result: 1新解、2缓存、0保底。
+  };
+  const DebugInfo& debugInfo() const { return debug_info_; }
+
+  // Valid only for the most recent, freshly solved plan. A fallback force has no associated preview.
+  bool getPreviewBodyCommand(Vec3& command) const;
+
+  ConvexMpcOutput solveMpc(const ConvexMpcInput& in);
+  [[nodiscard]] int predictionSteps(double prediction_dt, double gait_period) const;
+  
+    Vec34 solveFromDogWrench(
+      const Vec3& p_ref_G,          // 机身期望位置（世界系）；MPC 不接收 QP 外层 PD 加速度
+      const Vec34& foot_hold_G,     // 本次求解前更新的支撑脚 G 系估计位置
+      const Vec34& foot_end_G,      // 当前周期摆动腿最终落脚点（G系）
+      const VecInt4& contact_now,   // 当前 4 足接触状态，1 支撑，0 摆动
+      const std::vector<std::array<int, 4>>& contact_table, // WaveGenerator 给出的未来接触表，第 0 行为当前接触
+      double control_dt,            // MPC 预测步长；50 Hz 时为 0.02 s
+      double gait_period,           // wave_generator_->getGaitPeriod()
+      const Vec3& p_body_G,         // 机身位置（世界系）
+      const Vec3& v_body_G,         // 机身速度（世界系）
+      const RotMat& R_GB,           // 机身姿态（旋转矩阵）
+      const Vec3& gyro_G,           // 机身角速度（世界系）
+      const RotMat& Rd_GB,          // 机身期望姿态
+      const Vec3& v_ref_G,          // 机身指令速度（世界系），直接用于参考轨迹
+      const Vec4& liftoff_fz_limit = Vec4::Constant(1e19),
+      const std::vector<Vec4>* stage_force_limits = nullptr,
+      const std::vector<Vec4>* stage_force_minimum = nullptr
+  );
+
+private:
+  struct HpipmWorkspace;
+
+  void rebuildFixedMatrices();
+
+  const int nx_stage;       // 每个状态维度
+  const int nu_stage;       // 每个输入维度
+  const int rows_per_leg;   // 每条腿的行数
+  const int ng_stage;       // 每步一般线性约束行数
+  const double INF;
+
+  int N;
+  double mass;
+  Mat3 Ib;
+  Vec3 pcb_B;
+  Vec3 g;
+  double mu;
+  double fzMin;
+  double fzMax;
+  bool enforceHalfGaitHorizon;
+  Mat13 Q = Mat13::Zero();
+  Mat12 R = Mat12::Zero();
+  Mat12 S = Mat12::Zero();
+  double regularization;
+  bool enableFallbackToLast;
+  // hpipm_verbose = 是否打印 HPIPM 调试信息。
+  // true 时会输出 status、iter、N、dt 等。
+  // 实机运行时建议 false，调试求解失败时可以 true。
+  bool hpipm_verbose = false;
+
+  // last_u0_ 现在用于 HPIPM 失败时 fallback，也用于输入变化率项的上一帧输入。
+  Vec13 preview_state_ = Vec13::Zero();
+  bool preview_valid_ = false;
+  Vec12 last_u0_ = Vec12::Zero();
+  bool has_last_solution_ = false;
+  DebugInfo debug_info_;
+
+  std::unique_ptr<HpipmWorkspace> hpipm_;
+
+  MatX Q_cost_;
+  MatX R_cost_;
+  MatX R_cost_rate_;
+  VecX r_cost_zero_;
+  VecX r_cost_rate_;
+
+  MatX C_zero_constraint_;
+  MatX D_force_constraint_;
+
+  VecX lower_bound_stance_;
+  VecX upper_bound_stance_;
+  VecX lower_bound_swing_;
+  VecX upper_bound_swing_;
+
+  Vec34 makeFallbackForces(const VecInt4& contact_now) const;
+};

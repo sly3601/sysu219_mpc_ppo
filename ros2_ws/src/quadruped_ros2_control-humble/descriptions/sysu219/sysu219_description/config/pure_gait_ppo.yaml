@@ -1,0 +1,5 @@
+sysu219_guide_controller:
+  ros__parameters:
+    pure_gait_ppo: true
+    contact_shadow_inekf_enabled: false
+    contact_shadow_write_csv: false

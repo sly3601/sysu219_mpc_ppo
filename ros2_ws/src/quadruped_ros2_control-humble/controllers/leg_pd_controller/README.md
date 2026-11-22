@@ -1,0 +1,52 @@
+# Leg PD Controller
+
+This package contains a simple PD controller for the leg joints of the quadruped robot. By using this controller, other ros2-control controllers based on position control can also work on the hardware interface which only contains effort control (for example, gazebo ros2 control).
+
+Tested environment:
+* Ubuntu 24.04
+  * ROS2 Jazzy
+* Ubuntu 22.04
+  * ROS2 Humble (Gazebo Classic 11)
+
+The simulated actuator retains the MIT law `tau = tau_ff + kp*(q_ref-q) + kd*(qd_ref-qd)`.
+`position_min`, `position_max`, and `velocity_limits` bound joint references;
+`effort_limits` bounds both feedforward and the combined requested torque.
+KP/KD are restricted to the driver protocol ranges 0..500 and 0..5.
+`torque_response_time` (seconds) implements `T*d(tau_applied)/dt + tau_applied = tau_requested`
+with exact discrete integration; zero disables this actuator lag.
+The SYSU219 Gazebo configuration uses current hardware command limits and a configurable
+4 ms response assumption, not a measured motor time constant or a fitted model.
+This controller is used by Gazebo; real hardware executes PD inside the motor driver.
+
+## 1. Interfaces
+
+It is a chainable controller: it exports the reference interfaces listed below and consumes the
+`effort` command interface of the hardware.
+
+Provided (reference) interfaces:
+* joint position
+* joint velocity
+* joint effort
+* KP
+* KD
+
+Required hardware interfaces:
+* command:
+  * joint effort
+* state:
+  * joint position
+  * joint velocity
+
+## 2. Build
+```bash
+cd ~/sysu219_mpc_ppo/ros2_ws
+colcon build --packages-up-to leg_pd_controller
+```
+
+## 3. Run
+
+On Gazebo Classic 11 (ROS2 Humble) it is spawned automatically by
+[sysu219_guide_controller/launch/gazebo.launch.py](../sysu219_guide_controller/launch/gazebo.launch.py):
+```bash
+ros2 launch sysu219_guide_controller gazebo.launch.py pkg_description:=sysu219_description
+```

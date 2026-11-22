@@ -1,0 +1,56 @@
+cmake_minimum_required(VERSION 3.8)
+project(keyboard_input)
+
+if (CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options(-Wall -Wextra -Wpedantic)
+endif ()
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# find dependencies
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(control_input_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(ament_index_cpp REQUIRED)
+find_package(Qt5 REQUIRED COMPONENTS Widgets)
+
+add_executable(keyboard_input src/KeyboardInput.cpp)
+target_compile_features(keyboard_input PRIVATE cxx_std_17)
+target_include_directories(keyboard_input
+        PUBLIC
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+        "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>")
+ament_target_dependencies(
+        keyboard_input PUBLIC
+        rclcpp
+        control_input_msgs
+        std_msgs
+)
+target_link_libraries(keyboard_input PRIVATE Qt5::Widgets)
+# 新增：FixedStand 专用键盘节点
+add_executable(fixedstand_offset_keyboard src/FixedStandOffsetKeyboard.cpp)
+target_include_directories(fixedstand_offset_keyboard
+        PUBLIC
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+        "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>")
+ament_target_dependencies(
+        fixedstand_offset_keyboard PUBLIC
+        rclcpp
+        std_msgs
+)
+
+install(TARGETS
+        keyboard_input
+        fixedstand_offset_keyboard
+        DESTINATION lib/${PROJECT_NAME})
+
+add_executable(leg_identification_keyboard src/LegIdentificationKeyboard.cpp)
+ament_target_dependencies(leg_identification_keyboard rclcpp std_msgs)
+install(TARGETS leg_identification_keyboard DESTINATION lib/${PROJECT_NAME})
+add_executable(com_identification_keyboard src/ComIdentificationKeyboard.cpp)
+target_compile_features(com_identification_keyboard PRIVATE cxx_std_17)
+ament_target_dependencies(com_identification_keyboard rclcpp std_msgs ament_index_cpp)
+install(TARGETS com_identification_keyboard DESTINATION lib/${PROJECT_NAME})
+
+ament_package()

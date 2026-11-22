@@ -1,0 +1,3 @@
+sysu219_guide_controller:
+  ros__parameters:
+    mpc_ppo_foot_tracking: true

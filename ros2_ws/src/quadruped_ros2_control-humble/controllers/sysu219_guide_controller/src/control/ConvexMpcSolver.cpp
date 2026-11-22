@@ -1,0 +1,1334 @@
+#include "sysu219_guide_controller/control/ConvexMpcSolver.h"
+
+#include <sysu219_guide_controller/common/mathTools.h>
+
+#include <algorithm>
+#include <chrono>
+#include "sysu219_guide_controller/debug/DebugConfig.h"
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <new>
+#include <string>
+#include <vector>
+
+extern "C" {
+#include <hpipm_common.h>
+#include <hpipm_d_ocp_qp_dim.h>
+#include <hpipm_d_ocp_qp.h>
+#include <hpipm_d_ocp_qp_sol.h>
+#include <hpipm_d_ocp_qp_ipm.h>
+}
+
+#include <rclcpp/rclcpp.hpp>
+
+/*
+ * 本函数用于计算本次 MPC 实际应该用多少个预测步 N
+ * 根据“半个步态周期”限制，计算实际 HPIPM horizon steps。
+ *
+ * 参考论文中使用固定接触点近似。
+ *
+ * 这要求预测时域不能超过半个步态周期，否则同一条腿可能在预测域内二次落地，
+ * 第二次落地的足端点就不能继续用当前记录的固定接触点近似。
+ */
+static inline int computeEffectiveHorizon(
+    const int max_N,
+    const double dt,
+    const double gait_period,
+    const bool enforce_half_gait_horizon) {
+  if (max_N <= 0 || dt <= 0.0 || !std::isfinite(dt)) {  // 安全限制
+    return 0;
+  }
+
+  if (!enforce_half_gait_horizon) { // 如果不用半步态周期限制，也就是不用论文方法，直接返回 max_N
+    return max_N;
+  }
+
+  if (gait_period <= 0.0 || !std::isfinite(gait_period)) {
+    return 0;
+  }
+
+  const int N = static_cast<int>(std::floor(0.5 * gait_period / dt)); // 计算半个步态周期内能有多少个控制周期，也就是预测步数 N
+
+  if (N < 1) {
+    return 0;
+  }
+
+  return std::min(max_N, N);
+}
+
+/*
+ * HPIPM 的 C API 需要手动分配内存：
+ * 1. memsize
+ * 2. malloc
+ * 3. create
+ *
+ * MemoryBlock 负责 RAII 管理 malloc/free。
+ */
+class MemoryBlock {
+public:
+  explicit MemoryBlock(size_t size = 0) {
+    reserve(size);
+  }
+
+  ~MemoryBlock() noexcept {
+    std::free(ptr_);
+  }
+
+  void reserve(size_t size) {
+    if (size > size_) {
+      std::free(ptr_);
+      ptr_ = std::malloc(size);
+      if (ptr_ == nullptr) {
+        throw std::bad_alloc();
+      }
+      size_ = size;
+    }
+  }
+
+  void* get() {
+    return ptr_;
+  }
+
+  MemoryBlock(const MemoryBlock&) = delete;
+  MemoryBlock& operator=(const MemoryBlock&) = delete;
+
+private:
+  void* ptr_ = nullptr;
+  size_t size_ = 0;
+};
+
+struct ConvexMpcSolver::HpipmWorkspace {
+  // 新增：成功解对应的接触状态和时间，用于限制旧解的使用范围。
+  std::array<int, 4> last_solution_contact{{0, 0, 0, 0}};
+  std::chrono::steady_clock::time_point last_solution_time{};
+  // 仅用于日志；上一轮预测序列与成功解缓存分别记录。
+  std::vector<std::array<int, 4>> diag_previous_contact;
+  size_t diag_id = 0, diag_calls = 0, diag_fresh = 0, diag_failed = 0;
+  size_t diag_cached = 0, diag_gravity = 0;
+  Vec4 diag_max_failed_res = Vec4::Zero();
+  std::chrono::steady_clock::time_point diag_report_begin{};
+  int diag_iter_max = 0, diag_warm_start = 0;
+  Vec4 diag_tolerances = Vec4::Zero();
+  // 这是缓存当前 HPIPM 的问题规模。
+  // 如果本次 MPC 的规模和上次一样，就不重新分配 HPIPM 内存，只更新求解器参数
+  int cached_N = -1;
+  int cached_nx = -1;
+  int cached_nu = -1;
+  int cached_ng = -1;
+  bool initialized = false;
+
+  std::vector<int> nx;
+  std::vector<int> nu;
+  std::vector<int> nbx;
+  std::vector<int> nbu;
+  std::vector<int> ng;
+  std::vector<int> nsbx;
+  std::vector<int> nsbu;
+  std::vector<int> nsg;
+
+  std::vector<Mat13> A_stage;
+  std::vector<Mat1312> B_stage;
+  std::vector<Vec13> bb_stage;
+  std::vector<VecX> q_stage;
+  std::vector<VecX> lg_stage;
+  std::vector<VecX> ug_stage;
+
+  std::vector<double*> AA;
+  std::vector<double*> BB;
+  std::vector<double*> bb;
+
+  std::vector<double*> QQ;
+  std::vector<double*> RR;
+  std::vector<double*> SS;
+  std::vector<double*> qq;
+  std::vector<double*> rr;
+
+  std::vector<double*> CC;
+  std::vector<double*> DD;
+  std::vector<double*> llg;
+  std::vector<double*> uug;
+
+  MemoryBlock dimMem;
+  d_ocp_qp_dim dim;
+
+  MemoryBlock qpMem;
+  d_ocp_qp qp;
+
+  MemoryBlock qpSolMem;
+  d_ocp_qp_sol qpSol;
+
+  MemoryBlock ipmArgMem;
+  d_ocp_qp_ipm_arg arg;
+
+  MemoryBlock ipmMem;
+  d_ocp_qp_ipm_ws workspace;
+
+  void resizeIfNeeded(int N, int nx_stage, int nu_stage, int ng_stage) {
+    if (initialized &&  // 缓存优化，如果数组大小不变，则不重新申请内存
+        cached_N == N &&
+        cached_nx == nx_stage &&
+        cached_nu == nu_stage &&
+        cached_ng == ng_stage) {
+      applySettings();
+      return;
+    }
+
+    cached_N = N;
+    cached_nx = nx_stage;
+    cached_nu = nu_stage;
+    cached_ng = ng_stage;
+
+    nx.assign(N + 1, nx_stage);
+    nu.assign(N + 1, nu_stage);
+    nbx.assign(N + 1, 0);
+    nbu.assign(N + 1, 0);
+    ng.assign(N + 1, ng_stage);
+    nsbx.assign(N + 1, 0);
+    nsbu.assign(N + 1, 0);
+    nsg.assign(N + 1, 0);
+
+    // stage 0 的 x0 是已知初始状态，不作为 HPIPM 决策变量。
+    // 因此 nx[0] = 0。
+    nx[0] = 0;
+
+    // terminal stage 没有输入，也没有接触力约束。
+    nu[N] = 0;
+    ng[N] = 0;
+
+    A_stage.assign(N, Mat13::Zero());
+    B_stage.assign(N, Mat1312::Zero());
+    bb_stage.assign(N, Vec13::Zero());
+    q_stage.assign(N + 1, VecX::Zero(nx_stage));
+    lg_stage.assign(N, VecX::Zero(ng_stage));
+    ug_stage.assign(N, VecX::Zero(ng_stage));
+
+    AA.assign(N, nullptr);
+    BB.assign(N, nullptr);
+    bb.assign(N, nullptr);
+
+    QQ.assign(N + 1, nullptr);
+    RR.assign(N + 1, nullptr);
+    SS.assign(N + 1, nullptr);
+    qq.assign(N + 1, nullptr);
+    rr.assign(N + 1, nullptr);
+
+    CC.assign(N + 1, nullptr);
+    DD.assign(N + 1, nullptr);
+    llg.assign(N + 1, nullptr);
+    uug.assign(N + 1, nullptr);
+
+    const int dim_size = d_ocp_qp_dim_memsize(N);
+    dimMem.reserve(dim_size);
+    d_ocp_qp_dim_create(N, &dim, dimMem.get());
+
+    d_ocp_qp_dim_set_all(
+        nx.data(),
+        nu.data(),
+        nbx.data(),
+        nbu.data(),
+        ng.data(),
+        nsbx.data(),
+        nsbu.data(),
+        nsg.data(),
+        &dim
+    );
+
+    const int qp_size = d_ocp_qp_memsize(&dim);
+    qpMem.reserve(qp_size);
+    d_ocp_qp_create(&dim, &qp, qpMem.get());
+
+    const int qp_sol_size = d_ocp_qp_sol_memsize(&dim);
+    qpSolMem.reserve(qp_sol_size);
+    d_ocp_qp_sol_create(&dim, &qpSol, qpSolMem.get());
+
+    const int ipm_arg_size = d_ocp_qp_ipm_arg_memsize(&dim);
+    ipmArgMem.reserve(ipm_arg_size);
+    d_ocp_qp_ipm_arg_create(&dim, &arg, ipmArgMem.get());
+
+    applySettings();
+
+    const int ipm_size = d_ocp_qp_ipm_ws_memsize(&dim, &arg);
+    ipmMem.reserve(ipm_size);
+    d_ocp_qp_ipm_ws_create(&dim, &arg, &workspace, ipmMem.get());
+
+    initialized = true;
+  }
+
+  void applySettings() {
+    d_ocp_qp_ipm_arg_set_default(hpipm_mode::SPEED, &arg);
+
+    // 新增：覆盖上面的 SPEED 默认设置，使用数值鲁棒模式。
+    // 保留后面显式设置的容差、正则化和 Riccati 参数。
+    d_ocp_qp_ipm_arg_set_default(hpipm_mode::ROBUST, &arg);
+
+    int iter_max = 50;          // hpipm_iter_max = HPIPM 最大迭代次数
+    double alpha_min = 1e-12;   // hpipm_alpha_min = HPIPM 线搜索最小步长
+    double mu0 = 1e1;           // hpipm_mu0 = 初始 barrier parameter，内点法初始障碍参数
+
+    double tol_stat = 1e-6;     // hpipm_tol_stat = stationarity tolerance，驻点残差容忍度
+    double tol_eq = 1e-6;       // hpipm_tol_eq = equality constraint tolerance，等式约束残差容忍度
+    double tol_ineq = 1e-6;     // hpipm_tol_ineq = inequality constraint tolerance，不等式约束残差容忍度
+    double tol_comp = 1e-6;     // hpipm_tol_comp = complementarity tolerance，互补条件残差容忍度
+
+    double reg_prim = 1e-10;    // hpipm_reg_prim = primal regularization，原始变量正则化，用于改善数值稳定性
+    int warm_start = 0;         // hpipm_warm_start = 是否启用 HPIPM 内部热启动，0 表示不启用
+    int pred_corr = 1;          // hpipm_pred_corr = predictor-corrector 开关，pred = predictor，预测步；corr = corrector，校正步，1 表示启用
+    int ric_alg = 0;            // hpipm_ric_alg = Riccati algorithm，Riccati 递推算法类型，ric = Riccati，0 表示 square-root Riccati
+
+    // 新增：Gazebo 调试阶段先允许最多 60 次迭代，仍须检查实际耗时。
+    // HPIPM 的 ric_alg=0 是经典 Riccati，1 才是 square-root；原注释保留作记录。
+    // 新增说明：上方 60 次的原注释对应上一版，现恢复 30 次以限制耗时。
+    iter_max = 50;
+    diag_iter_max = iter_max;
+    diag_warm_start = warm_start;
+    diag_tolerances = Vec4(tol_stat, tol_eq, tol_ineq, tol_comp);
+    d_ocp_qp_ipm_arg_set_iter_max(&iter_max, &arg);
+    d_ocp_qp_ipm_arg_set_alpha_min(&alpha_min, &arg);
+    d_ocp_qp_ipm_arg_set_mu0(&mu0, &arg);
+    d_ocp_qp_ipm_arg_set_tol_stat(&tol_stat, &arg);
+    d_ocp_qp_ipm_arg_set_tol_eq(&tol_eq, &arg);
+    d_ocp_qp_ipm_arg_set_tol_ineq(&tol_ineq, &arg);
+    d_ocp_qp_ipm_arg_set_tol_comp(&tol_comp, &arg);
+    d_ocp_qp_ipm_arg_set_reg_prim(&reg_prim, &arg);
+    d_ocp_qp_ipm_arg_set_warm_start(&warm_start, &arg);
+    d_ocp_qp_ipm_arg_set_pred_corr(&pred_corr, &arg);
+    d_ocp_qp_ipm_arg_set_ric_alg(&ric_alg, &arg);
+  }
+};
+
+ConvexMpcSolver::ConvexMpcSolver()
+  : nx_stage(13),     // 每个状态维度：Theta(3), p_com(3), omega(3), v_com(3), g_z(1)
+    nu_stage(12),     // 每个输入维度：4 条腿的足底力，每条腿 3 维
+    rows_per_leg(7),  // 每条腿的约束行数：摩擦锥 5 行 + 摆动腿强制 fx=0, fy=0 的 2 行
+    ng_stage(28),     // 每步一般线性约束行数：4 条腿 * 每条腿 7 行约束
+    INF(1e19),        // 无穷大，用于约束上下界
+    hpipm_(new HpipmWorkspace()) {
+  // 状态顺序：
+  // x = [Theta(3), p_com(3), omega(3), v_com(3), g_z(1)]
+
+  N = 15;                          // 恢复 50 Hz MPC 的原预测时域：5 * 20 ms = 100 ms。
+  mass = 41.5;                    // 机器人质量，单位 kg
+  // 整机绕质心的等效惯量，B 系 x/y/z（横滚/俯仰/偏航），单位 kg*m^2。
+  // 2026-11-02：按 DAE 几何和 DM-J10010-2EC 集中质量粗估，尚非实测标定。
+  Ib = Vec3(1.1, 3.7, 4.1).asDiagonal();
+  pcb_B = Vec3::Zero();           // pcb_B 表示“从机身原点 body 到质心 COM 的偏移向量”，在 B 系下表达。COM = body + R * pcb_B
+  g = Vec3(0.0, 0.0, -9.81);      // 重力加速度向量
+
+  mu = 0.35;                      // 规划摩擦系数；WBC松弛优化沿用同一参数。
+  fzMin = 0.0;
+  fzMax = 350.0;
+
+  enforceHalfGaitHorizon = true;  // 保留当前固定落点模型的半步态周期限制。
+
+  // regularization = 数值正则化系数。
+  // 加到 QP Hessian 对角线上，避免矩阵病态或半正定导致求解器不稳定。
+  regularization = 1e-8;
+  enableFallbackToLast = true;    // enableFallbackToLast = 求解失败时是否回退到上一帧成功求解的足底力。
+
+  Q.setZero();
+  R.setZero();
+  S.setZero();
+  Q.diagonal() << 741.549295775, 850.0, 43, // 3轴角度；按2026-11-03末次真机rev17固化。
+                      950.0,  1225.0,  1990.0,// 3轴位置。
+                      166.220987898,   176.669014085,   5, // 3轴角速度。
+                      1425.0,   1300.4542749460002,   360.0, // 3轴速度。
+                      0.0;          // 重力
+
+  R.diagonal() << 1, 1, 1,  // 力大小限制惩罚权重
+                      1, 1, 1,
+                      1, 1, 1,
+                      1, 1, 1;
+
+  // R/S 最终权重，仿真和实机共用。
+  R.diagonal() << 1e-4, 1e-4, 1e-6,  // FR: fx, fy, fz
+                  1e-4, 1e-4, 1e-6,  // FL
+                  1e-4, 1e-4, 1e-6,  // RR
+                  1e-4, 1e-4, 1e-6;  // RL
+  // 各腿 fx/fy/fz 的最终对角权重，已计入原来的 2.5 倍缩放及 fz 耦合对角项。
+  S.diagonal() << 0.00601993232955, 0.007, 0.0035,  // FR: fx, fy, fz
+                  0.00601993232955, 0.007, 0.0035,  // FL
+                  0.00601993232955, 0.007, 0.0035,  // RR
+                  0.00601993232955, 0.007, 0.0035;  // RL
+
+  // 总竖直承重变化惩罚的跨腿耦合；对应的对角项已包含在上面的 fz 中。
+  S(2, 5) = S(5, 2) = 0.0025;    // FR / FL
+  S(2, 8) = S(8, 2) = 0.0025;    // FR / RR
+  S(2, 11) = S(11, 2) = 0.0025;  // FR / RL
+  S(5, 8) = S(8, 5) = 0.0025;    // FL / RR
+  S(5, 11) = S(11, 5) = 0.0025;  // FL / RL
+  S(8, 11) = S(11, 8) = 0.0025;  // RR / RL
+
+  rebuildFixedMatrices();
+}
+
+ConvexMpcSolver::~ConvexMpcSolver() = default;
+
+bool ConvexMpcSolver::updateCostWeights(const Mat13& q, const Mat12& r, const Mat12& s) noexcept {
+  if ((Q.array() == q.array()).all() && (R.array() == r.array()).all() &&
+      (S.array() == s.array()).all()) return false;
+  Q = q;
+  R = r;
+  S = s;
+  // 这些缓存已由构造函数分配。逐元素写入确保实时路径不 resize、不分配。
+  // 不调用 rebuildFixedMatrices：它还会重建与本次调参无关的动态约束缓存。
+  for (int row = 0; row < 13; ++row) {
+    for (int col = 0; col < 13; ++col) {
+      Q_cost_(row, col) = 2.0 * Q(row, col) + (row == col ? regularization : 0.0);
+    }
+  }
+  for (int row = 0; row < 12; ++row) {
+    for (int col = 0; col < 12; ++col) {
+      const double reg = row == col ? regularization : 0.0;
+      R_cost_(row, col) = 2.0 * R(row, col) + reg;
+      R_cost_rate_(row, col) = 2.0 * (R(row, col) + S(row, col)) + reg;
+    }
+  }
+  // r_cost_rate_ 在下一次 solveMpc 中按新 S 与原 last_u0_ 重新计算。
+  // 保留上一帧力参考，使调参本身不清空力变化惩罚的历史。
+  return true;
+}
+
+void ConvexMpcSolver::rebuildFixedMatrices() {
+
+  /*
+  R / S 是你定义的权重。
+  R_cost_ / R_cost_rate_ 是根据权重预先算好的矩阵。
+  hpipm_->RR[k] / hpipm_->rr[k] 是最后传给 HPIPM 的接口。
+  */
+  Q_cost_ = MatX::Zero(nx_stage, nx_stage);
+  Q_cost_.noalias() = 2.0 * Q;
+  Q_cost_.diagonal().array() += regularization;
+
+  R_cost_ = MatX::Zero(nu_stage, nu_stage);
+  R_cost_.noalias() = 2.0 * R;
+  R_cost_.diagonal().array() += regularization;
+
+
+  // R：惩罚足底力本身太大
+  // S：惩罚当前足底力相对上一帧变化太大
+  R_cost_rate_ = MatX::Zero(nu_stage, nu_stage);
+  R_cost_rate_.noalias() = 2.0 * (R + S); // 这里是计算之后的中间过程项，为了符合HPIPM的格式生态
+  R_cost_rate_.diagonal().array() += regularization;
+
+  r_cost_zero_ = VecX::Zero(nu_stage);
+  r_cost_rate_ = VecX::Zero(nu_stage);
+
+  // 单条腿的固定输入约束矩阵。
+  // 这个矩阵只依赖 mu，不依赖 k，也不依赖 contact。
+  //
+  // 前 5 行严格对应论文式(7)：
+  // [ -1  0  mu ]
+  // [  0 -1  mu ]
+  // [  1  0  mu ]
+  // [  0  1  mu ]
+  // [  0  0   1 ]
+  //
+  // 后 2 行只用于摆动腿时强制 fx=0, fy=0。
+  MatX leg_force_constraint = MatX::Zero(rows_per_leg, 3);
+  leg_force_constraint <<
+      -1.0,  0.0, mu,
+       0.0, -1.0, mu,
+       1.0,  0.0, mu,
+       0.0,  1.0, mu,
+       0.0,  0.0,          1.0,
+       1.0,  0.0,          0.0,
+       0.0,  1.0,          0.0;
+
+  // 输入约束矩阵，论文中的摩擦锥约束实际填在这里。
+  D_force_constraint_ = MatX::Zero(ng_stage, nu_stage);
+  for (int leg = 0; leg < 4; ++leg) {
+    const int row = rows_per_leg * leg;
+    const int col = 3 * leg;
+    D_force_constraint_.block(row, col, rows_per_leg, 3) = leg_force_constraint;
+  }
+
+  // 状态约束矩阵，论文中没有状态约束，所以 C_stage 全零。
+  // 对所有 k>=1 相同，所以只构造一次。
+  C_zero_constraint_ = MatX::Zero(ng_stage, nx_stage);
+
+
+  // 以下为约束的上下界模板
+  // 对应的是论文中摩擦锥约束公式两端的两个ci上下界
+  // 在支撑足情况下，前5项都与论文公式一致
+  // 6和7项在支撑足时不约束，在摆动足时强制 fx=0, fy=0
+  // 摆动足限幅约束全部取消，而是所有力全部强制置0，因为这里限幅的是地面对足端的接触反作用力，所以摆动时设置为0是正确的
+
+
+  // 支撑腿上下界模板。
+  lower_bound_stance_ = VecX::Zero(rows_per_leg);
+  upper_bound_stance_ = VecX::Zero(rows_per_leg);
+
+  lower_bound_stance_ <<
+       0.0,
+       0.0,
+       0.0,
+       0.0,
+       fzMin,
+      -INF,
+      -INF;
+
+  upper_bound_stance_ <<
+       INF,
+       INF,
+       INF,
+       INF,
+       fzMax,
+       INF,
+       INF;
+
+  // 摆动腿上下界模板。
+  lower_bound_swing_ = VecX::Zero(rows_per_leg);
+  upper_bound_swing_ = VecX::Zero(rows_per_leg);
+
+  lower_bound_swing_ <<
+      -INF,
+      -INF,
+      -INF,
+      -INF,
+       0.0,
+       0.0,
+       0.0;
+
+  upper_bound_swing_ <<
+       INF,
+       INF,
+       INF,
+       INF,
+       0.0,
+       0.0,
+       0.0;
+}
+
+
+void ConvexMpcSolver::reset() {
+  preview_valid_ = false;
+  last_u0_.setZero();
+  has_last_solution_ = false;
+}
+
+// MPC 求解失败/输入非法时的保底力分配函数
+Vec34 ConvexMpcSolver::makeFallbackForces(const VecInt4& contact_now) const {
+  Vec34 force;
+  force.setZero();
+
+  int stance_count = 0; // 统计当前有几条腿是支撑腿
+  for (int leg = 0; leg < 4; ++leg) {
+    if (contact_now(leg) == 1) {
+      ++stance_count;
+    }
+  }
+
+  const bool no_stance = (stance_count == 0);
+  if (no_stance) return force; // 不为悬空脚编造重力支撑；上层负责零/单足失载保护。
+  const int effective_stance_count = stance_count;
+
+  const double fz_nominal =
+      mass * std::abs(g(2)) / static_cast<double>(effective_stance_count);
+
+  const double fz = std::min(fzMax, std::max(fzMin, fz_nominal));
+
+  static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
+  RCLCPP_WARN_THROTTLE(
+      rclcpp::get_logger("ConvexMpcSolver"),
+      steady_clock,
+      350,
+      "[ConvexMpcSolver] 警告：MPC 求解失败或输入非法，当前使用保底力。"
+      "contact=[%d %d %d %d]，支撑腿数量=%d，保底 fz=%.3f",
+      contact_now(0),
+      contact_now(1),
+      contact_now(2),
+      contact_now(3),
+      stance_count,
+      fz
+  );
+
+  for (int leg = 0; leg < 4; ++leg) {
+    if (contact_now(leg) == 1) {
+      force(2, leg) = fz;
+    }
+  }
+
+  return force;
+}
+
+ConvexMpcOutput ConvexMpcSolver::solveMpc(const ConvexMpcInput& in) {
+  preview_valid_ = false;
+  ConvexMpcOutput out;
+
+  const int horizon_N = in.N;
+
+  if (horizon_N <= 0 ||
+      static_cast<int>(in.xRef.size()) < horizon_N + 1 ||
+      static_cast<int>(in.contact.size()) < horizon_N ||
+      static_cast<int>(in.rFeet.size()) < horizon_N ||
+      in.dt <= 0.0 ||
+      !std::isfinite(in.dt) ||
+      !in.x0.allFinite() ||
+      !in.Iw_inv.allFinite()) {
+    return out;
+  }
+
+  
+  /*
+    N          // MPC 预测步数
+    nx_stage   // 每个状态维度，13，包括 Theta(3), p_com(3), omega(3), v_com(3), g_z(1)
+    nu_stage   // 每个输入维度，12，包括 4 条腿的足底力，每条腿 3 维
+    ng_stage   // 每步一般线性约束行数，4*7=28，包括 4 条腿，每条腿 7 行约束（摩擦锥 5 行 + 摆动腿强制 fx=0, fy=0 的 2 行）
+  */
+  // HPIPM 的求解器内存准备函数，设置基础参数并分配内存。
+  hpipm_->resizeIfNeeded(horizon_N, nx_stage, nu_stage, ng_stage);
+
+  // ====== 线性离散 SRBD 模型 ======
+  //
+  // 论文状态：
+  // x = [Theta, p_com, omega, v_com, g_z]
+  // 离散形式：
+  // x(k+1) = A_k x(k) + B_k u(k)
+  //
+  // 重力通过状态最后一维 g_z 进入速度更新：
+  // v(k+1) = v(k) + dt * e_z * g_z + dt/m * sum(f_i)
+
+  for (int k = 0; k < horizon_N; ++k) {
+    hpipm_->A_stage[k].setIdentity(); //先补充为单位阵，再填入非单位部分
+    hpipm_->B_stage[k].setZero();
+
+    // yaw_d：第 k 个参考状态里的期望 yaw。
+    // 论文公式 A_k 中使用 R_z^T(_d psi^k)。
+    const double yaw_d = in.xRef[k](2); // xRef[k] 的第 3 个元素是 yaw。
+    hpipm_->A_stage[k].block<3,3>(0, 6) = rotz(yaw_d).transpose() * in.dt;  // <行数, 列数>(起始行, 起始列)，dt * Rz^T(yaw_d)
+    hpipm_->A_stage[k].block<3,3>(3, 9) = Mat3::Identity() * in.dt;
+    hpipm_->A_stage[k](11, 12) = in.dt;
+
+    for (int leg = 0; leg < 4; ++leg) {
+      const Vec3& r = in.rFeet[k][leg];     // 力臂r
+      hpipm_->B_stage[k].block<3,3>(6, 3 * leg) =
+          in.dt * in.Iw_inv * skew(r);
+      hpipm_->B_stage[k].block<3,3>(9, 3 * leg) =
+          (in.dt / mass) * Mat3::Identity();
+    }
+  }
+
+  // ====== Stage cost 代价函数 ======
+  //
+  // 论文目标：
+  // J = (X-D)^T Q (X-D) + U^T R U
+  //
+  // HPIPM stage cost 形式：
+  // 0.5*x^T Q*x + 0.5*u^T R*u + q^T*x + r^T*u
+  //
+  // 因此为了等价于论文中的平方项，代码中使用 2*Q 和 2*R。
+
+  // stage 1 ... stage N-1 有状态代价；
+  // stage 0 的 x0 是已知初始状态，不作为 HPIPM 决策变量，所以没有 Q_stage[0]。
+  for (int k = 1; k < horizon_N; ++k) {
+    hpipm_->q_stage[k].noalias() = -2.0 * Q * in.xRef[k];
+  }
+
+  // terminal cost：终端状态 x_N 的跟踪代价,单独拿出来方便以后算法单独设置Q权重
+  hpipm_->q_stage[horizon_N].noalias() = -2.0 * Q * in.xRef[horizon_N];
+
+  // ====== Constraints: lg <= C*x + D*u <= ug ======
+  // 约束下界 l_g，约束矩阵 C 和 D，约束上界 u_g
+  // 每条腿 7 行：
+  // 0: -fx + mu*fz
+  // 1: -fy + mu*fz
+  // 2:  fx + mu*fz
+  // 3:  fy + mu*fz
+  // 4:  fz
+  // 5:  fx
+  // 6:  fy
+
+
+  // 设置摩擦锥的上下界矩阵ci
+  if (!in.stage_force_limits.empty()) {
+    if (static_cast<int>(in.stage_force_limits.size()) != horizon_N) return out;
+    for (const auto& cap : in.stage_force_limits)
+      if (!cap.allFinite() || (cap.array() < 0.0).any()) return out;
+  }
+  if (!in.stage_force_minimum.empty()) {
+    if (static_cast<int>(in.stage_force_minimum.size()) != horizon_N || in.stage_force_limits.empty()) return out;
+    for (int k = 0; k < horizon_N; ++k)
+      if (!in.stage_force_minimum[k].allFinite() || (in.stage_force_minimum[k].array() < 0.0).any() ||
+          (in.stage_force_minimum[k].array() > in.stage_force_limits[k].array()).any()) return out;
+  }
+  for (int k = 0; k < horizon_N; ++k) {
+    for (int leg = 0; leg < 4; ++leg) {
+      const int row = rows_per_leg * leg;
+
+      if (in.contact[k][leg] == 0) {
+        // swing: fx=fy=fz=0
+        hpipm_->lg_stage[k].segment(row, rows_per_leg) = lower_bound_swing_;
+        hpipm_->ug_stage[k].segment(row, rows_per_leg) = upper_bound_swing_;
+      } else {
+        // stance
+        hpipm_->lg_stage[k].segment(row, rows_per_leg) = lower_bound_stance_;
+        hpipm_->ug_stage[k].segment(row, rows_per_leg) = upper_bound_stance_;
+        if (k == 0) hpipm_->ug_stage[k](row + 4) = std::min(fzMax, in.liftoff_fz_limit(leg));     // 支撑腿的 fz 上界，受 liftoff_fz_limit 限制
+        if (!in.stage_force_limits.empty())
+          hpipm_->ug_stage[k](row + 4) = std::min(hpipm_->ug_stage[k](row + 4), in.stage_force_limits[k](leg));
+        if (!in.stage_force_minimum.empty())
+          hpipm_->lg_stage[k](row + 4) = std::max(fzMin, in.stage_force_minimum[k](leg));
+      }
+    }
+  }
+
+  // AA/BB/bb 是 HPIPM 对动力学矩阵的命名习惯。
+  //
+  // 对 k>=1：
+  //   x_{k+1} = AA[k] * x_k + BB[k] * u_k + bb[k]
+  //   其中 bb[k] = 0
+  //
+  // 对 k=0：
+  //   因为 x0 是已知初始状态，不作为决策变量，
+  //   所以 HPIPM stage 0 写成：
+  //   x_1 = BB[0] * u_0 + bb[0]
+  //
+  // 这里的 bb[0] = A_0 * x_0。
+  // 这不是论文外新增的物理 b_k，只是 HPIPM 在消去已知 x0 后的接口写法。
+  // 因为nx[0] = 0，x0不进入优化器，所以要把x1的状态转移方程中的 A_0*x0 这部分当作常数项 bb[0] 告诉 HPIPM。
+  hpipm_->bb_stage[0] = hpipm_->A_stage[0] * in.x0; // 只有bb_stage[0] 是非零的
+
+  // 赋值第0步单独写，因为 AA[0] 不作为优化变量不能传
+  hpipm_->BB[0] = hpipm_->B_stage[0].data();
+  hpipm_->bb[0] = hpipm_->bb_stage[0].data();
+
+  for (int k = 1; k < horizon_N; ++k) {
+    hpipm_->AA[k] = hpipm_->A_stage[k].data();
+    hpipm_->BB[k] = hpipm_->B_stage[k].data();
+    hpipm_->bb[k] = hpipm_->bb_stage[k].data();
+  }
+
+  // QQ/RR/SS/qq/rr 是 HPIPM 对 stage cost 的命名习惯。
+  //
+  // QQ[k]：状态二次项 Q。
+  // RR[k]：输入二次项 R。
+  // SS[k]：输入-状态交叉项 S。
+  // qq[k]：状态一次项 q。
+  // rr[k]：输入一次项 r。
+  //
+  // 论文目标：
+  // J = (X-D)^T Q (X-D) + U^T R U
+  //
+  // HPIPM stage cost 形式：
+  // 0.5*x^T Q*x + 0.5*u^T R*u + q^T*x + r^T*u
+  //
+  // 当前在论文目标基础上，对真正会执行的 u0 额外加入：
+  // (u0 - last_u0)^T S (u0 - last_u0)，其中这个权重系数S代码中是S，不是HPIPM里的状态交叉项SS，完全不同的
+
+
+  /* 
+    last_u0_：上一次成功算出的四脚力。
+    S：多大程度上要求力变化平缓。
+    R_cost_rate_、r_cost_rate_：给求解器用的两个计算系数，它们不是足底力。
+ 
+  */
+  if (has_last_solution_ && !S.isZero(0)) {         // 已有上次成功求解的力，并且启用了力变化惩罚 S。
+    // 上次求解会屏蔽摆动足的代价耦合，每次必须先恢复完整矩阵。
+    R_cost_rate_.noalias() = R_cost_ + 2.0 * S;     // 这句是重新计算并覆盖整个矩阵
+    // 保留上次所有腿的承重，避免抬脚时把总承重参考也一起减掉。
+    r_cost_rate_.noalias() = -2.0 * S * last_u0_; // 这里是计算之后的中间过程项
+    hpipm_->RR[0] = R_cost_rate_.data();
+    hpipm_->rr[0] = r_cost_rate_.data();
+  } else {
+    hpipm_->RR[0] = R_cost_.data();
+    hpipm_->rr[0] = r_cost_zero_.data();
+  }
+
+  // HPIPM 的输入-状态交叉项：12×13 零矩阵
+  // 必须放在循环外，保证调用求解器时内存有效
+  MatX zero_state_input_cross = MatX::Zero(nu_stage, nx_stage);
+  for (int k = 1; k < horizon_N; ++k) {
+    hpipm_->SS[k] = zero_state_input_cross.data();
+
+    hpipm_->QQ[k] = Q_cost_.data();
+    hpipm_->RR[k] = R_cost_.data();
+    hpipm_->qq[k] = hpipm_->q_stage[k].data();
+    hpipm_->rr[k] = r_cost_zero_.data();
+  }
+  
+
+  // xN不是没用，而是用来评价：最后一步控制 u(N-1) 把系统推到了哪里
+  hpipm_->QQ[horizon_N] = Q_cost_.data();
+  hpipm_->qq[horizon_N] = hpipm_->q_stage[horizon_N].data();
+
+  // CC/DD/llg/uug 是 HPIPM 对一般线性约束的命名习惯。
+  //
+  // 约束形式：
+  // llg[k] <= CC[k]*x_k + DD[k]*u_k <= uug[k]
+  //
+  // 当前约束只作用于输入足底力 u，所以 CC 可以为零。
+  for (int k = 0; k < horizon_N; ++k) {
+    // 第一句分类讨论的意义
+    // 第 0 步：C0 连尺寸都不该是 28x13，因为 nx[0]=0
+    // 第 1 步以后：Ck 尺寸是 28x13，但内容全是 0
+    hpipm_->CC[k] = (k == 0) ? nullptr : C_zero_constraint_.data(); // C没用到
+    hpipm_->DD[k] = D_force_constraint_.data();
+    hpipm_->llg[k] = hpipm_->lg_stage[k].data();
+    hpipm_->uug[k] = hpipm_->ug_stage[k].data();
+  }
+
+  // unused box/slack constraints，不用管
+  int** hidxbx = nullptr;
+  double** hlbx = nullptr;
+  double** hubx = nullptr;
+
+  int** hidxbu = nullptr;
+  double** hlbu = nullptr;
+  double** hubu = nullptr;
+
+  double** hZl = nullptr;
+  double** hZu = nullptr;
+  double** hzl = nullptr;
+  double** hzu = nullptr;
+
+  int** hidxs = nullptr;
+  double** hlls = nullptr;
+  double** hlus = nullptr;
+
+  // 不求解，只装填，d_ocp_qp_set_all函数把前面准备好的所有 MPC 数学数据，统一写进 HPIPM 的 QP 问题对象 hpipm_->qp 里
+  // 新增：用 HPIPM mask 关闭无效边界，不让 +/-INF 参与内点法计算。
+  // 支撑腿启用摩擦锥下界和 fz 上下界；
+  // 摆动腿屏蔽一般约束，下面同时取消其动力学作用和代价耦合。
+  std::vector<VecX> lower_masks(horizon_N, VecX::Zero(ng_stage));
+  std::vector<VecX> upper_masks(horizon_N, VecX::Zero(ng_stage));
+  for (int k = 0; k < horizon_N; ++k) {
+    for (int leg = 0; leg < 4; ++leg) {
+      const int row = rows_per_leg * leg;
+      if (in.contact[k][leg] == 1) {
+        lower_masks[k].segment(row, 5).setOnes();
+        upper_masks[k](row + 4) = 1.0;
+      } else {
+        lower_masks[k].segment(row + 4, 3).setOnes();
+        upper_masks[k].segment(row + 4, 3).setOnes();
+      }
+    }
+    // 当前 R 为正对角阵，S 含总承重耦合，输入-状态交叉项为零。
+    // 摆动足从动力学和首阶段 S 中移除，仅保留正的 R 代价，使其最优力为零。
+    for (int leg = 0; leg < 4; ++leg) {
+      if (in.contact[k][leg] == 0) {
+        hpipm_->B_stage[k].block<13, 3>(0, 3 * leg).setZero();
+        const int row = rows_per_leg * leg;
+        lower_masks[k].segment(row, rows_per_leg).setZero();
+        upper_masks[k].segment(row, rows_per_leg).setZero();
+        // 首阶段摆动足不能用虚假力抵消支撑足的总承重代价。
+        if (k == 0) {
+          R_cost_rate_.middleRows(3 * leg, 3).setZero();
+          R_cost_rate_.middleCols(3 * leg, 3).setZero();
+          R_cost_rate_.block<3, 3>(3 * leg, 3 * leg) = R_cost_.block<3, 3>(3 * leg, 3 * leg);
+          r_cost_rate_.segment<3>(3 * leg).setZero();
+        }
+      }
+    }
+
+    // 无效边界的数值也置零；真正取消约束的是下面传给 HPIPM 的 mask。
+    for (int row = 0; row < ng_stage; ++row) {
+      if (lower_masks[k](row) == 0.0) {
+        hpipm_->lg_stage[k](row) = 0.0;
+      }
+      if (upper_masks[k](row) == 0.0) {
+        hpipm_->ug_stage[k](row) = 0.0;
+      }
+    }
+  }
+
+  d_ocp_qp_set_all(
+      hpipm_->AA.data(), hpipm_->BB.data(), hpipm_->bb.data(),
+      hpipm_->QQ.data(), hpipm_->SS.data(), hpipm_->RR.data(), hpipm_->qq.data(), hpipm_->rr.data(),
+      hidxbx, hlbx, hubx,
+      hidxbu, hlbu, hubu,
+      hpipm_->CC.data(), hpipm_->DD.data(), hpipm_->llg.data(), hpipm_->uug.data(),
+      hZl, hZu, hzl, hzu,
+      hidxs, hlls, hlus,
+      &hpipm_->qp
+  );
+
+  // 新增：set_all 之后设置 mask；每次装填后都重新设置。
+  for (int k = 0; k < horizon_N; ++k) {
+    d_ocp_qp_set_lg_mask(k, lower_masks[k].data(), &hpipm_->qp);
+    d_ocp_qp_set_ug_mask(k, upper_masks[k].data(), &hpipm_->qp);
+  }
+
+  // 求解 QP 问题，得到 hpipm_->qpSol 解
+  // 新增：测量求解器本身的耗时，不含整个控制周期的其他工作。
+  const auto solve_begin_time = quadruped_debug::Csv_DebugMode ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
+  d_ocp_qp_ipm_solve(&hpipm_->qp, &hpipm_->qpSol, &hpipm_->arg, &hpipm_->workspace);
+
+  const auto solve_end_time = quadruped_debug::Csv_DebugMode ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
+  const double solve_ms =
+      std::chrono::duration<double, std::milli>(solve_end_time - solve_begin_time).count();
+
+  // 从 HPIPM 的 workspace 里读取求解状态，hpipm_status == 0表示求解成功，hpipm_status < 0 表示求解失败。
+  int hpipm_status = -1;
+  d_ocp_qp_ipm_get_status(&hpipm_->workspace, &hpipm_status);
+
+  // 新增说明：HPIPM 以 status=0 表示成功；正数也是失败状态。
+  // status=1 表示迭代达到上限，并不直接证明问题不可行。
+  // 四个残差依次为：驻点、动力学等式、不等式、互补条件。
+  double diag_stat = 0.0, diag_eq = 0.0, diag_ineq = 0.0, diag_comp = 0.0;
+  int diag_iter = -1;
+  if (quadruped_debug::Csv_DebugMode) {
+    d_ocp_qp_ipm_get_iter(&hpipm_->workspace, &diag_iter);
+    d_ocp_qp_ipm_get_max_res_stat(&hpipm_->workspace, &diag_stat);
+    d_ocp_qp_ipm_get_max_res_eq(&hpipm_->workspace, &diag_eq);
+    d_ocp_qp_ipm_get_max_res_ineq(&hpipm_->workspace, &diag_ineq);
+    d_ocp_qp_ipm_get_max_res_comp(&hpipm_->workspace, &diag_comp);
+  }
+  // 每个实际求解结果只统计一次；失败详情不受成功日志的限频影响。
+  const double diag_cache_age_ms = quadruped_debug::Csv_DebugMode && has_last_solution_ ?
+      std::chrono::duration<double, std::milli>(
+          solve_end_time - hpipm_->last_solution_time).count() : -1.0;
+  const bool diag_same_contact = has_last_solution_ &&
+      in.contact[0] == hpipm_->last_solution_contact;
+  bool reused_last_solution = false;
+  auto log_result = [&](const char* action, const char* reason) {
+    if (!quadruped_debug::Csv_DebugMode) return;
+    if (hpipm_->diag_id++ == 0) hpipm_->diag_report_begin = solve_begin_time;
+    debug_info_ = {hpipm_->diag_id, hpipm_status, diag_iter,
+                   !out.success ? 0 : reused_last_solution ? 2 : 1};
+    ++hpipm_->diag_calls;
+    const bool failed = hpipm_status != 0 || reused_last_solution || !out.success;
+    if (failed) {
+      ++hpipm_->diag_failed;
+      hpipm_->diag_max_failed_res = hpipm_->diag_max_failed_res.cwiseMax(
+          Vec4(diag_stat, diag_eq, diag_ineq, diag_comp));
+    }
+    if (out.success && !reused_last_solution) ++hpipm_->diag_fresh;
+    if (reused_last_solution) ++hpipm_->diag_cached;
+    if (!out.success) ++hpipm_->diag_gravity;
+    if (failed) {
+      const char* status_name = hpipm_status == 0 ? "SUCCESS" :
+          hpipm_status == 1 ? "MAX_ITER" : hpipm_status == 2 ? "MIN_STEP" :
+          hpipm_status == 3 ? "NAN_SOL" : hpipm_status == 4 ? "INCONS_EQ" : "UNKNOWN";
+      auto contact_sequence = [](const std::vector<std::array<int, 4>>& contact) {
+        std::string result;
+        for (const auto& step : contact) {
+          if (!result.empty()) result += '>';
+          for (int value : step) result += value == 1 ? '1' : '0';
+        }
+        return result.empty() ? std::string("none") : result;
+      };
+      const auto& previous = hpipm_->diag_previous_contact;
+      static rclcpp::Clock detail_clock(RCL_STEADY_TIME);
+      RCLCPP_ERROR_THROTTLE(
+          rclcpp::get_logger("ConvexMpcSolver"), detail_clock, 500,
+          "[MPC_FAIL] id=%zu status=%d(%s) iter=%d/%d warm_start=%d "
+          "solve_ms=%.3f N=%d prediction_ms=%.3f "
+          "res[stat,eq,ineq,comp]=[%.3e %.3e %.3e %.3e] "
+          "tol[stat,eq,ineq,comp]=[%.3e %.3e %.3e %.3e] "
+          "action=%s reason=%s cached=%d same_contact=%d cache_age_ms=%.3f cache_limit_ms=none "
+          "current_contact_changed=%d horizon_changed=%d prev_seq=%s seq=%s "
+          "pz=%.4f vz=%.4f pitch=%.4f pitch_ref=%.4f omega_pitch=%.4f",
+          hpipm_->diag_id, hpipm_status, status_name, diag_iter, hpipm_->diag_iter_max,
+          hpipm_->diag_warm_start, solve_ms, horizon_N, in.dt * 1000.0,
+          diag_stat, diag_eq, diag_ineq, diag_comp,
+          hpipm_->diag_tolerances(0), hpipm_->diag_tolerances(1),
+          hpipm_->diag_tolerances(2), hpipm_->diag_tolerances(3), action, reason,
+          static_cast<int>(has_last_solution_), static_cast<int>(diag_same_contact),
+          diag_cache_age_ms,
+          static_cast<int>(!previous.empty() && previous[0] != in.contact[0]),
+          static_cast<int>(!previous.empty() && previous != in.contact),
+          contact_sequence(previous).c_str(), contact_sequence(in.contact).c_str(),
+          in.x0(5), in.x0(11), in.x0(1), in.xRef[0](1), in.x0(7));
+    }
+    hpipm_->diag_previous_contact = in.contact;
+    const double window_s = std::chrono::duration<double>(
+        solve_end_time - hpipm_->diag_report_begin).count();
+    if (window_s >= 1.0) {
+      RCLCPP_INFO(rclcpp::get_logger("ConvexMpcSolver"),
+          "[MPC_HEALTH] window_s=%.3f solves=%zu fresh=%zu failed=%zu "
+          "cached_used=%zu gravity_returned=%zu "
+          "max_failed_res[stat,eq,ineq,comp]=[%.3e %.3e %.3e %.3e]",
+          window_s, hpipm_->diag_calls, hpipm_->diag_fresh, hpipm_->diag_failed,
+          hpipm_->diag_cached, hpipm_->diag_gravity,
+          hpipm_->diag_max_failed_res(0), hpipm_->diag_max_failed_res(1),
+          hpipm_->diag_max_failed_res(2), hpipm_->diag_max_failed_res(3));
+      hpipm_->diag_report_begin = solve_end_time;
+      hpipm_->diag_calls = hpipm_->diag_fresh = hpipm_->diag_failed = 0;
+      hpipm_->diag_cached = hpipm_->diag_gravity = 0;
+      hpipm_->diag_max_failed_res.setZero();
+    }
+  };
+  if (quadruped_debug::Csv_DebugMode) {
+    static rclcpp::Clock residual_clock(RCL_STEADY_TIME);
+    RCLCPP_INFO_THROTTLE(
+        rclcpp::get_logger("ConvexMpcSolver"), residual_clock, 1000,
+        "[MPC_RES] status=%d iter=%d res[stat,eq,ineq,comp]=[%.3e %.3e %.3e %.3e]",
+        hpipm_status, diag_iter, diag_stat, diag_eq, diag_ineq, diag_comp);
+
+    static rclcpp::Clock timing_clock(RCL_STEADY_TIME);
+    RCLCPP_INFO_THROTTLE(
+        rclcpp::get_logger("ConvexMpcSolver"), timing_clock, 1000,
+        "[MPC_TIMING] solve_ms=%.3f nominal_step_ms=%.3f N=%d horizon_ms=%.3f status=%d iter=%d",
+        solve_ms, in.dt * 1000.0, horizon_N, horizon_N * in.dt * 1000.0,
+        hpipm_status, diag_iter);
+  }
+
+  if (quadruped_debug::Csv_DebugMode && hpipm_verbose) {
+    int hpipm_iter = -1;
+    d_ocp_qp_ipm_get_iter(&hpipm_->workspace, &hpipm_iter);
+
+    std::fprintf(stderr,
+                 "[ConvexMpcSolver][HPIPM] status=%d, iter=%d, N=%d, dt=%.6f\n",
+                 hpipm_status,
+                 hpipm_iter,
+                 horizon_N,
+                 in.dt);
+  }
+
+  if (hpipm_status != 0) {// 求解失败
+    if (enableFallbackToLast && has_last_solution_ && last_u0_.allFinite()) {// 如果可以返回上一帧就返回
+      // 同一支撑模式下保持上次成功的力；不因超过 20 ms 切换到均分重力。
+      // 支撑腿变化时不能直接复用旧力；复用也不刷新成功缓存及时间。
+      const bool same_contact = (in.contact[0] == hpipm_->last_solution_contact);
+      if (!same_contact) {
+        log_result("gravity", "cache_contact_mismatch");
+        return out;
+      }
+      out.u0 = last_u0_;
+      out.success = true;
+      reused_last_solution = true;
+      log_result("cached", "hold_last_success");
+      return out;
+    }
+
+    log_result("gravity", !enableFallbackToLast ? "cache_disabled" :
+        !has_last_solution_ ? "no_cached_solution" : "nonfinite_cached_force");
+    return out;
+  }
+
+  // 从 HPIPM 解中提取第一步的控制输入 u0
+  d_ocp_qp_sol_get_u(0, &hpipm_->qpSol, out.u0.data());
+
+  out.success = out.u0.allFinite();
+  if (!out.success && enableFallbackToLast && has_last_solution_ &&
+      last_u0_.allFinite() && diag_same_contact) {
+    out.u0 = last_u0_;
+    out.success = true;
+    reused_last_solution = true;
+    log_result("cached", "nonfinite_force_hold_last_success");
+    return out;
+  }
+  log_result(out.success ? "fresh" : "gravity",
+      out.success ? "solved" : "nonfinite_force");
+
+  if (out.success) {
+    // x0 is eliminated; stages 1..N contain the optimized 13-element centroidal state.
+    // Five 20 ms stages give the walking actor a 100 ms preview.
+    d_ocp_qp_sol_get_x(std::min(5, horizon_N), &hpipm_->qpSol, preview_state_.data());
+    preview_valid_ = preview_state_.allFinite();
+
+    // 新增：明确清零当前摆动足输出，消除数值误差后再统计和缓存。
+    for (int leg = 0; leg < 4; ++leg) {
+      if (in.contact[0][leg] == 0) {
+        out.u0.segment<3>(3 * leg).setZero();
+      }
+    }
+    // 新增：只对本次成功解记录接触反力，不把保底力当成 MPC 成功解。
+    if (quadruped_debug::Csv_DebugMode) {
+      double total_fz = 0.0;
+      for (int leg = 0; leg < 4; ++leg) {
+        total_fz += out.u0(3 * leg + 2);
+      }
+      static rclcpp::Clock force_clock(RCL_STEADY_TIME);
+      RCLCPP_INFO_THROTTLE(
+          rclcpp::get_logger("ConvexMpcSolver"), force_clock, 1000,
+          "[MPC_FORCE] fresh_solution=1 sum_fz=%.3f expected_weight=%.3f contact=[%d %d %d %d]",
+          total_fz, mass * std::abs(g(2)), in.contact[0][0], in.contact[0][1],
+          in.contact[0][2], in.contact[0][3]);
+    }
+    // 新增：只有本次实际成功求解才更新缓存的接触状态和时间。
+    hpipm_->last_solution_contact = in.contact[0];
+    hpipm_->last_solution_time = solve_end_time;
+    last_u0_ = out.u0;
+    has_last_solution_ = true;
+  }
+
+  return out;
+}
+
+int ConvexMpcSolver::predictionSteps(
+    const double prediction_dt, const double gait_period) const {
+  return computeEffectiveHorizon(N, prediction_dt, gait_period, enforceHalfGaitHorizon);
+}
+
+Vec34 ConvexMpcSolver::solveFromDogWrench(
+    const Vec3& p_ref_G,         // 机身期望位置，G 系表达；与指令速度生成参考，不使用 QP 的 Kpp/Kdp。
+    const Vec34& foot_hold_G,    // 本次求解前更新的支撑脚估计位置，G 系表达；该次预测内按固定支点处理。
+    const Vec34& foot_end_G,     // 在摆动腿时，预期足底支撑落点
+    const VecInt4& contact_now,  // 当前四条腿接触状态。1 表示支撑腿，0 表示摆动腿。顺序为 FR, FL, RR, RL。
+    const std::vector<std::array<int, 4>>& contact_table, // 步态生成器提供的接触预测，第 0 行对应当前控制帧。
+    const double control_dt,     // MPC 预测步长，单位秒；50 Hz 时为 0.02 s，用于动力学、参考轨迹和接触预测。
+    const double gait_period,    // 当前完整步态周期，单位秒。例如 trot 一个完整周期的时间。
+    const Vec3& p_body_G,        // 当前机身原点位置，G 系表达。后面会结合 pcb_B 转成质心位置 p_com_G。
+    const Vec3& v_body_G,        // 当前机身原点线速度，G 系表达。后面会结合质心偏置和角速度转成质心速度 v_com_G。
+    const RotMat& R_GB,          // 当前机身姿态旋转矩阵，表示从 B 系到 G 系的旋转。用于计算 RPY、质心偏置、世界系惯量。
+    const Vec3& gyro_G,          // 当前机身角速度，G 系表达。对应论文状态里的 omega。
+    const RotMat& Rd_GB,         // 期望机身姿态旋转矩阵，B 系到 G 系。用于生成参考姿态 theta_ref。
+    const Vec3& v_ref_G,         // 期望机身/质心线速度，G 系表达。用于生成参考速度和参考位置轨迹。
+    const Vec4& liftoff_fz_limit,
+    const std::vector<Vec4>* stage_force_limits,
+    const std::vector<Vec4>* stage_force_minimum
+    ) {
+  preview_valid_ = false;
+  // 新增诊断：只记录原因，不改变原来的保底返回和控制参数。
+  // finite 数组中 1 表示数值有限，0 表示该输入含 NaN 或 Inf。
+  auto log_fallback_reason = [&](const char* reason) {
+    if (!quadruped_debug::Csv_DebugMode) return;
+    static rclcpp::Clock input_clock(RCL_STEADY_TIME);
+    RCLCPP_ERROR_THROTTLE(
+        rclcpp::get_logger("ConvexMpcSolver"), input_clock, 1000,
+        "[MPC_DIAG] fallback=%s dt=%.6f gait=%.6f contact_steps=%zu "
+        "finite[pref,hold,end,p,v,R,gyro,Rd,vref]=[%d %d %d %d %d %d %d %d %d]",
+        reason, control_dt, gait_period, contact_table.size(),
+        static_cast<int>(p_ref_G.allFinite()),
+        static_cast<int>(foot_hold_G.allFinite()),
+        static_cast<int>(foot_end_G.allFinite()),
+        static_cast<int>(p_body_G.allFinite()),
+        static_cast<int>(v_body_G.allFinite()),
+        static_cast<int>(R_GB.allFinite()),
+        static_cast<int>(gyro_G.allFinite()),
+        static_cast<int>(Rd_GB.allFinite()),
+        static_cast<int>(v_ref_G.allFinite()));
+  };
+
+  if (control_dt <= 0.0 || !std::isfinite(control_dt)) {  // 控制周期必须正数且有限
+    log_fallback_reason("invalid_control_dt");
+    return makeFallbackForces(contact_now);
+  }
+
+  if (gait_period <= 0.0 || !std::isfinite(gait_period)) { // 步态周期必须正数且有限
+    log_fallback_reason("invalid_gait_period");
+    return makeFallbackForces(contact_now);
+  }
+
+  if (N <= 0 ||
+      mass <= 0.0 ||
+      !std::isfinite(mass) ||
+      !std::isfinite(mu) ||
+      !std::isfinite(fzMin) ||
+      !std::isfinite(fzMax) ||
+      mu <= 0.0 ||
+      fzMax < fzMin ||
+      !Ib.allFinite() ||
+      !pcb_B.allFinite() ||
+      !g.allFinite()) {
+    log_fallback_reason("invalid_model_parameters");
+    return makeFallbackForces(contact_now);
+  }
+
+  if (!p_ref_G.allFinite() ||
+      !foot_hold_G.allFinite() ||
+      !foot_end_G.allFinite() ||
+      !p_body_G.allFinite() ||
+      !v_body_G.allFinite() ||
+      !R_GB.allFinite() ||
+      !gyro_G.allFinite() ||
+      !Rd_GB.allFinite() ||
+      !v_ref_G.allFinite()) {
+    log_fallback_reason("nonfinite_input");
+    return makeFallbackForces(contact_now);
+  }
+
+  for (int leg = 0; leg < 4; ++leg) {
+    if (contact_now(leg) != 0 && contact_now(leg) != 1) {
+      log_fallback_reason("invalid_contact");
+      return makeFallbackForces(contact_now);
+    }
+  }
+
+  ConvexMpcInput in;
+  in.dt = control_dt;
+  in.liftoff_fz_limit = liftoff_fz_limit.cwiseMax(fzMin).cwiseMin(fzMax);
+
+  in.N = predictionSteps(in.dt, gait_period);
+  if (stage_force_limits) in.stage_force_limits = *stage_force_limits;
+  if (stage_force_minimum) in.stage_force_minimum = *stage_force_minimum;
+
+  if (in.N <= 0) {
+    log_fallback_reason("empty_horizon");
+    return makeFallbackForces(contact_now);
+  }
+
+  if (static_cast<int>(contact_table.size()) != in.N) {
+    log_fallback_reason("invalid_contact_table_size");
+    return makeFallbackForces(contact_now);
+  }
+  for (int leg = 0; leg < 4; ++leg) {
+    if (contact_table[0][leg] != contact_now(leg)) {
+      log_fallback_reason("contact_table_current_mismatch");
+      return makeFallbackForces(contact_now);
+    }
+  }
+  for (const auto& step : contact_table) {
+    for (int contact : step) {
+      if (contact != 0 && contact != 1) {
+        log_fallback_reason("invalid_contact_table_value");
+        return makeFallbackForces(contact_now);
+      }
+    }
+  }
+
+  // ====== 计算：x0 = [Theta, p_com, omega, v_com, g_z] ======
+  //
+  // 论文状态顺序：
+  // x = [Theta(3), p_com(3), omega(3), v_com(3), g_z(1)]
+
+  const Vec3 theta_now = rotMatToRPY(R_GB);
+  const Vec3 p_com_G = p_body_G + R_GB * pcb_B; // 将标准中心位置加上质心位置偏移
+  const Vec3 v_com_G = v_body_G + gyro_G.cross(R_GB * pcb_B); // cross()是 Eigen 的叉乘函数，也是质心位置补偿
+
+  in.x0.setZero();
+  in.x0.segment<3>(0) = theta_now;
+  in.x0.segment<3>(3) = p_com_G;
+  in.x0.segment<3>(6) = gyro_G;
+  in.x0.segment<3>(9) = v_com_G;
+  in.x0(12) = g(2);
+
+  // 新增：检查刚进入 Trotting 时的高度、竖直速度和参考姿态。
+  // first_pending=1 表示尚未有成功解；48 N 不能仅凭总力认定原因。
+  if (quadruped_debug::Csv_DebugMode) {
+    const Vec3 diag_theta_ref = rotMatToRPY(Rd_GB);
+    static rclcpp::Clock state_clock(RCL_STEADY_TIME);
+    RCLCPP_INFO_THROTTLE(
+        rclcpp::get_logger("ConvexMpcSolver"), state_clock, 1000,
+        "[MPC_STATE] first_pending=%d pz=%.4f vz=%.4f pz_ref=%.4f vz_ref=%.4f "
+        "rp_now=[%.4f %.4f] rp_ref=[%.4f %.4f]",
+        static_cast<int>(!has_last_solution_), p_com_G(2), v_com_G(2),
+        p_ref_G(2), v_ref_G(2), theta_now(0), theta_now(1),
+        diag_theta_ref(0), diag_theta_ref(1));
+  }
+
+  // ====== xRef (N + 1) ====== 计算N+1个时刻之后的期望状态值
+  in.xRef.resize(in.N + 1); // 生成 N+1 个未来期望状态。
+
+  Vec3 theta_ref = rotMatToRPY(Rd_GB);
+  // 将目标偏航放在最接近当前偏航的等价分支，避免跨 ±π 时产生近 2π 的跟踪误差。
+  const double yaw_error = theta_ref(2) - theta_now(2);
+  if (std::abs(yaw_error) > M_PI) {
+    theta_ref(2) -= std::copysign(2.0 * M_PI, yaw_error);
+  }
+  const Vec3 p_com_ref_G = p_ref_G + Rd_GB * pcb_B;
+
+  for (int k = 0; k <= in.N; ++k)
+  {
+    const double t_k = static_cast<double>(k) * in.dt;
+
+    in.xRef[k].setZero();
+
+    in.xRef[k].segment<3>(0) = theta_ref;
+
+    // 从当前质心参考位置出发，按指令速度生成未来各节点的位置参考。
+    in.xRef[k].segment<3>(3) = (p_com_ref_G + v_ref_G * t_k).eval();    // 考虑当前位置加上速度乘以时间的线性预测，作为未来的质心位置参考。
+    // 这里的 eval() 是 Eigen 的一个函数，用于强制计算表达式并返回一个新的对象，避免延迟计算带来的潜在问题。
+
+    in.xRef[k].segment<3>(6) << 0.0, 0.0, 0.0;
+
+    in.xRef[k].segment<3>(9) = v_ref_G;
+    if (!in.xRef[k].allFinite()) {
+      log_fallback_reason("nonfinite_reference_trajectory");
+      return makeFallbackForces(contact_now);
+    }
+
+    in.xRef[k](12) = g(2);
+  }
+
+  // ====== contact schedule (N) ======
+  // 直接使用步态生成器的预测，包含全支撑/全摆动和状态切换。
+  in.contact = contact_table; // 预测将来的接触状态表，N 步长。
+
+  // ====== rFeet schedule (N) ======
+  //
+  // foot_hold_G 由 StateTrotting 传入：
+  // foot_hold_G.col(i) = 本次求解前更新的第 i 条支撑腿 G 系估计位置。
+  //
+  // 这里不做任何足端正解，也不重新做 body->foot 到 world 的坐标变换。
+  // MPC 这里只需要计算 SRBD 转动动力学里的力臂：
+  //
+  // r_i(k) = p_foot_i - p_com_now
+  //
+  // 其中：
+  // p_foot_hold_i 是外部已经记录好的 G 系固定接触点；
+  // 按本次测量 COM 冻结力臂，目标位置误差不作为实际几何变化。
+
+  in.rFeet.resize(in.N);
+
+  const Mat3 Iw = R_GB * Ib * R_GB.transpose();           // 计算G系下的惯性矩阵
+  const Eigen::LDLT<Mat3> ldlt(Iw);                       // LDLT 是一种矩阵分解方法
+
+  if (ldlt.info() == Eigen::Success) 
+  {
+    in.Iw_inv = ldlt.solve(Mat3::Identity());             // 求解 Iw 的逆矩阵
+  } 
+  else 
+  {
+    log_fallback_reason("inertia_factorization_failed");
+    return makeFallbackForces(contact_now);
+  }
+
+  if (!in.Iw_inv.allFinite()) {
+    log_fallback_reason("nonfinite_inverse_inertia");
+    return makeFallbackForces(contact_now);
+  }
+
+  // 构造 MPC 预测时域内每一步的 足端力臂 rFeet
+  for (int k = 0; k < in.N; ++k) {
+    std::array<Vec3, 4> rk;
+
+    for (int leg = 0; leg < 4; ++leg) {
+      if (contact_now(leg) == 1) {
+        rk[leg] = foot_hold_G.col(leg) - p_com_G;       // 计算支撑腿力臂
+      } else {
+        rk[leg] = foot_end_G.col(leg) - p_com_G;        // 摆动腿使用预期落点计算力臂
+      }
+    }
+
+    in.rFeet[k] = rk;
+  }
+
+  // ====== solve MPC ======
+  const ConvexMpcOutput out = solveMpc(in);
+
+  Vec34 force_feet_P = Vec34::Zero();
+  if (!out.success) {
+    log_fallback_reason("solveMpc_no_usable_solution");
+    force_feet_P = makeFallbackForces(contact_now);
+  }
+
+  for (int leg = 0; out.success && leg < 4; ++leg) {
+    force_feet_P(0, leg) = out.u0(3 * leg + 0);
+    force_feet_P(1, leg) = out.u0(3 * leg + 1);
+    force_feet_P(2, leg) = out.u0(3 * leg + 2);
+  }
+
+  // 缓存/重力保底也必须遵守卸载上限；移出的竖直负载交给其余支撑腿。
+  double removed_fz = 0.0;
+  Vec4 capacity = Vec4::Zero();
+  for (int leg = 0; leg < 4; ++leg) {
+    const double limit = contact_now(leg) == 1 ? in.liftoff_fz_limit(leg) : 0.0;
+    const double fz = force_feet_P(2, leg);
+    if (fz > limit) {
+      removed_fz += fz - limit;
+      force_feet_P.col(leg) *= limit / fz;
+    }
+    capacity(leg) = std::max(0.0, limit - force_feet_P(2, leg));
+  }
+  const double available_fz = capacity.sum();
+  if (available_fz > 0.0)
+    force_feet_P.row(2) += (std::min(removed_fz, available_fz) / available_fz * capacity).transpose();
+
+  return force_feet_P;
+}
+
+
+bool ConvexMpcSolver::getPreviewBodyCommand(Vec3& command) const {
+  if (!preview_valid_) return false;
+  const RotMat R_GB = rotz(preview_state_(2)) * roty(preview_state_(1)) * rotx(preview_state_(0));
+  const Vec3 omega_B = R_GB.transpose() * preview_state_.segment<3>(6);
+  // v_com = v_base + omega x (R_GB * base_to_com). The actor tracks the base origin.
+  const Vec3 velocity_B = R_GB.transpose() * preview_state_.segment<3>(9) - omega_B.cross(pcb_B);
+  command << velocity_B.x(), velocity_B.y(), omega_B.z();
+  return command.allFinite();
+}

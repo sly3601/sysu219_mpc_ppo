@@ -1,0 +1,857 @@
+//
+// Created by tlab-uav on 24-9-6.
+//
+
+#include "sysu219_guide_controller/Sysu219GuideController.h"
+#include "COM_identification/StateComIdentification.h"
+#include "sysu219_guide_controller/control/ShadowInEKF.hpp"
+#ifdef SYSU219_ENABLE_CONTACT_SHADOW
+#include "sysu219_guide_controller/control/ContactShadowInEKF.hpp"
+#endif
+
+#include <sysu219_guide_controller/gait/WaveGenerator.h>
+#include "sysu219_guide_controller/robot/QuadrupedRobot.h"
+#include "sysu219_guide_controller/common/mathTools.h"
+#include "sysu219_guide_controller/debug/DebugConfig.h"
+#include "sysu219_guide_controller/debug/TrottingDebug.h"
+
+#include <Eigen/Geometry>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+
+namespace sysu219_guide_controller
+{
+    using config_type = controller_interface::interface_configuration_type;
+
+
+    controller_interface::InterfaceConfiguration Sysu219GuideController::command_interface_configuration() const
+    {
+        controller_interface::InterfaceConfiguration conf = {config_type::INDIVIDUAL, {}};
+
+        conf.names.reserve(joint_names_.size() * command_interface_types_.size());
+        for (const auto& joint_name : joint_names_)
+        {
+            for (const auto& interface_type : command_interface_types_)
+            {
+                if (!command_prefix_.empty())
+                {
+                    conf.names.push_back(command_prefix_ + "/" + joint_name + "/" + interface_type);
+                }
+                else
+                {
+                    conf.names.push_back(joint_name + "/" + interface_type);
+                }
+            }
+        }
+
+        return conf;
+    }
+
+    controller_interface::InterfaceConfiguration Sysu219GuideController::state_interface_configuration() const
+    {
+        // 诊断接口可选：真机导出hw_debug，Gazebo或旧硬件缺失时也不增加必需接口。
+        // 激活时仍按原来的完整名称及顺序绑定控制所用的关节和IMU接口。
+        if (legacyStatesEnabled() && quadruped_debug::Csv_DebugMode) return {config_type::ALL, {}};
+        controller_interface::InterfaceConfiguration conf = {config_type::INDIVIDUAL, {}};
+
+        conf.names.reserve(joint_names_.size() * state_interface_types_.size());
+        for (const auto& joint_name : joint_names_)
+        {
+            for (const auto& interface_type : state_interface_types_)
+            {
+                conf.names.push_back(joint_name + "/" + interface_type);
+            }
+        }
+
+        for (const auto& interface_type : imu_interface_types_)
+        {
+            conf.names.push_back(imu_name_ + "/" + interface_type);
+        }
+
+        return conf;
+    }
+
+    controller_interface::return_type Sysu219GuideController::
+    update(const rclcpp::Time& time, const rclcpp::Duration& period)
+    {
+        if (ctrl_component_.robot_model_ == nullptr)
+        {
+            return controller_interface::return_type::OK;
+        }
+
+        ctrl_component_.robot_model_->update();
+        ctrl_component_.wave_generator_->update(period.seconds());
+        ctrl_component_.estimator_->update();
+        const bool fixed_prior = current_state_ == state_list_.fixedStand || current_state_ == state_list_.freeStand;
+        if (shadow_inekf_)
+            shadow_inekf_->submit(time, period, ctrl_interfaces_, *ctrl_component_.wave_generator_,
+                                  *ctrl_component_.estimator_, fixed_prior);
+#ifdef SYSU219_ENABLE_CONTACT_SHADOW
+        if (contact_shadow_inekf_)
+            contact_shadow_inekf_->submit(time, period, ctrl_interfaces_, *ctrl_component_.wave_generator_,
+                *ctrl_component_.estimator_, fixed_prior, last_odometry_ready_);
+#endif
+        bool odometry_ready = ctrl_component_.odometry_mode == 0;
+        ctrl_component_.contact_observation_ready = false;
+        if (ctrl_component_.odometry_mode == 1 && shadow_inekf_)
+            odometry_ready = shadow_inekf_->selectForControl(time, *ctrl_component_.estimator_);
+#ifdef SYSU219_ENABLE_CONTACT_SHADOW
+        if (ctrl_component_.odometry_mode == 2 && contact_shadow_inekf_) {
+            odometry_ready = contact_shadow_inekf_->selectForControl(time, *ctrl_component_.estimator_);
+            if (odometry_ready)
+                ctrl_component_.contact_observation_ready = contact_shadow_inekf_->controlContact(
+                    time, ctrl_component_.contact_observation);
+        }
+#endif
+        last_odometry_ready_ = odometry_ready;
+        // RLWALK consumes raw IMU/joints and does not use translational odometry.
+        if (ctrl_component_.odometry_mode != 0 && !odometry_ready &&
+            (current_state_ == state_list_.trotting || current_state_ == state_list_.balanceTest)) {
+            const bool use_passive = ctrl_interfaces_.control_inputs_.command == 1 ||
+                (current_state_ == state_list_.trotting && !state_list_.trotting->jointFeedbackValid());
+            auto stop_state = use_passive ?
+                std::shared_ptr<FSMState>(state_list_.passive) : std::shared_ptr<FSMState>(state_list_.fixedStand);
+            stop_state->previous_state_name = current_state_->state_name;
+            current_state_->exit();
+            current_state_ = next_state_ = stop_state;
+            next_state_name_ = current_state_->state_name;
+            mode_ = FSMMode::NORMAL;
+            current_state_->enter();
+            RCLCPP_ERROR(get_node()->get_logger(),
+                "[ODOMETRY] %s失效，已切入%s；不自动切换估计器/原点。",
+                odometry_source_.c_str(), current_state_->state_name_string.c_str());
+        }
+
+        // 仅 Gazebo 配置开启；所有 FSM 状态都以约 25 Hz 输出 MPC 的估计质心。
+        if (com_estimated_pub_ && ctrl_component_.convex_mpc_) {
+            const auto stamp = get_node()->get_clock()->now();
+            const double now_s = stamp.seconds();
+            if (now_s < last_com_publish_s_ || now_s - last_com_publish_s_ >= 0.04) {
+                const Vec3 com_G = ctrl_component_.estimator_->getPosition()
+                    + ctrl_component_.estimator_->getRotation()
+                      * ctrl_component_.convex_mpc_->comOffsetBody();
+                if (com_G.allFinite()) {
+                    geometry_msgs::msg::PointStamped msg;
+                    msg.header.frame_id = "world";
+                    msg.header.stamp = stamp;
+                    msg.point.x = com_G(0);
+                    msg.point.y = com_G(1);
+                    msg.point.z = com_G(2);
+                    com_estimated_pub_->publish(msg);
+                }
+                last_com_publish_s_ = now_s;
+            }
+        }
+
+        if (tf_broadcaster_)
+        {
+            geometry_msgs::msg::TransformStamped tf_msg;
+
+            Vec3 pos_body = ctrl_component_.estimator_->getPosition();
+            RotMat rotation_body = ctrl_component_.estimator_->getRotation();
+            Eigen::Quaterniond q(rotation_body);
+
+            tf_msg.header.stamp = get_node()->get_clock()->now();
+            tf_msg.header.frame_id = "world";
+            tf_msg.child_frame_id = base_name_;
+
+            tf_msg.transform.translation.x = pos_body(0);
+            tf_msg.transform.translation.y = pos_body(1);
+            tf_msg.transform.translation.z = pos_body(2);
+
+            tf_msg.transform.rotation.w = q.w();
+            tf_msg.transform.rotation.x = q.x();
+            tf_msg.transform.rotation.y = q.y();
+            tf_msg.transform.rotation.z = q.z();
+
+            tf_broadcaster_->sendTransform(tf_msg);
+        }
+
+
+        if (ctrl_interfaces_.body_debug_pub)
+        {
+            std_msgs::msg::Float64MultiArray msg;
+
+            Vec3 pos_body = ctrl_component_.estimator_->getPosition();
+            Vec3 vel_body = ctrl_component_.estimator_->getVelocity();
+            RotMat rotation_body = ctrl_component_.estimator_->getRotation();
+            Vec3 rpy_body = rotMatToRPY(rotation_body);
+
+            const auto feet_2b = ctrl_component_.robot_model_->getFeet2BPositions();
+
+            // 0-2: pos_body
+            msg.data.push_back(pos_body(0));
+            msg.data.push_back(pos_body(1));
+            msg.data.push_back(pos_body(2));
+
+            // 3-5: vel_body
+            msg.data.push_back(vel_body(0));
+            msg.data.push_back(vel_body(1));
+            msg.data.push_back(vel_body(2));
+
+            // // 6-8: roll pitch yaw
+            msg.data.push_back(rpy_body(0));
+            msg.data.push_back(rpy_body(1));
+            msg.data.push_back(rpy_body(2));
+
+            // 三轴加速度
+            const double ax = ctrl_interfaces_.imu_state_interface_[7].get().get_value();
+            const double ay = ctrl_interfaces_.imu_state_interface_[8].get().get_value();
+            const double az = ctrl_interfaces_.imu_state_interface_[9].get().get_value();
+
+            msg.data.push_back(ax);
+            msg.data.push_back(ay);
+            msg.data.push_back(az);
+
+            // // 0-2: FR x y z
+            // msg.data.push_back(feet_2b[0].p.x());
+            // msg.data.push_back(feet_2b[0].p.y());
+            // msg.data.push_back(feet_2b[0].p.z());
+
+            // // 3-5: FL x y z
+            // msg.data.push_back(feet_2b[1].p.x());
+            // msg.data.push_back(feet_2b[1].p.y());
+            // msg.data.push_back(feet_2b[1].p.z());
+
+            // // 6-8: RR x y z
+            // msg.data.push_back(feet_2b[2].p.x());
+            // msg.data.push_back(feet_2b[2].p.y());
+            // msg.data.push_back(feet_2b[2].p.z());
+
+            // // 9-11: RL x y z
+            // msg.data.push_back(feet_2b[3].p.x());
+            // msg.data.push_back(feet_2b[3].p.y());
+            // msg.data.push_back(feet_2b[3].p.z());
+
+
+            ctrl_interfaces_.body_debug_pub->publish(msg);
+        }
+
+        // 2026.04.28关键修改：把状态机的更新放在最后，否则会漏掉一拍新状态
+        if (mode_ == FSMMode::NORMAL)
+        {
+            const bool enter_identification = state_list_.legIdentification &&
+                state_list_.legIdentification->consumeEntryRequest();
+            next_state_name_ = enter_identification && current_state_ == state_list_.passive
+                ? FSMStateName::LEGIDENTIFICATION : current_state_->checkChange();
+            if (state_list_.comIdentification && state_list_.comIdentification->consumeEntryRequest(
+                    current_state_ == state_list_.fixedStand))
+                next_state_name_ = FSMStateName::COMIDENTIFICATION;
+
+            // The gait/stand profiles expose exactly the states constructed on activation.
+            if (!legacyStatesEnabled() && next_state_name_ != current_state_->state_name &&
+                !getNextState(next_state_name_)) {
+                ctrl_interfaces_.control_inputs_.command = 0;
+                next_state_name_ = current_state_->state_name;
+                RCLCPP_INFO(get_node()->get_logger(), "Requested mode disabled, holding %s",
+                    current_state_->state_name_string.c_str());
+            }
+            if (next_state_name_ != current_state_->state_name)
+            {
+                mode_ = FSMMode::CHANGE;
+                next_state_ = getNextState(next_state_name_);
+                // 兜底：状态名没有对应实现时 next_state_ 会是空指针，绝不能让下面直接解引用
+                if (!next_state_)
+                {
+                    RCLCPP_ERROR(get_node()->get_logger(),
+                                 "FSM 找不到状态实现（state id %d），强制切到 PASSIVE",
+                                 static_cast<int>(next_state_name_));
+                    next_state_ = state_list_.passive;
+                }
+                // 记下"上一状态名"，让 next_state_ 的 enter() 能据此决定过渡策略
+                next_state_->previous_state_name = current_state_->state_name;
+            }
+            else
+            {
+                current_state_->run(time, period);
+            }
+        }
+        else if (mode_ == FSMMode::CHANGE)
+        {
+            const bool reject_odometry = !odometry_ready && (next_state_ == state_list_.trotting ||
+                next_state_ == state_list_.balanceTest);
+            if (reject_odometry) {
+                RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000,
+                    "[ODOMETRY] InEKF 当前无可用状态，保持当前状态；具体原因见 [SHADOW_INEKF] 日志。");
+                ctrl_interfaces_.control_inputs_.command = 0;
+                next_state_ = current_state_;
+                next_state_name_ = current_state_->state_name;
+            }
+            // IMU 无数据时禁止进入任何非 PASSIVE 状态（防无姿态反馈下运动）。
+            const double iw = ctrl_interfaces_.imu_state_interface_[0].get().get_value();
+            const double ix = ctrl_interfaces_.imu_state_interface_[1].get().get_value();
+            const double iy = ctrl_interfaces_.imu_state_interface_[2].get().get_value();
+            const double iz = ctrl_interfaces_.imu_state_interface_[3].get().get_value();
+            const bool imu_valid = std::isfinite(iw) && std::isfinite(ix) &&
+                std::isfinite(iy) && std::isfinite(iz) &&
+                std::abs(iw * iw + ix * ix + iy * iy + iz * iz - 1.0) < 0.1;
+            const bool reject_imu = !imu_valid && next_state_ != state_list_.passive;
+            if (reject_imu) {
+                RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000,
+                    "[IMU] 尚未收到有效 IMU 数据，拒绝切换状态；请检查 IMU 串口/朝向。");
+                ctrl_interfaces_.control_inputs_.command = 0;
+                next_state_ = current_state_;
+                next_state_name_ = current_state_->state_name;
+            }
+            bool reject_trotting = false;
+            if (next_state_ == state_list_.trotting)
+            {
+                // 进入前按相对零度的绝对角度检查，不能把过大的倾斜锁成目标姿态。
+                constexpr double trotting_entry_tilt_limit_deg = 5.0;
+                constexpr double rad_to_deg = 180.0 / M_PI;
+                const Vec3 entry_rpy = rotMatToRPY(ctrl_component_.estimator_->getRotation());
+                const bool contact_not_ready = ctrl_component_.contact_feedback_enabled &&
+                    (!ctrl_component_.contact_observation_ready ||
+                     ctrl_component_.contact_observation.contact != std::array<int, 4>{{1, 1, 1, 1}});
+                reject_trotting = !state_list_.trotting->ready() || !state_list_.trotting->jointFeedbackValid() ||
+                    contact_not_ready || !entry_rpy.allFinite() ||
+                    std::abs(entry_rpy(0)) * rad_to_deg > trotting_entry_tilt_limit_deg ||
+                    std::abs(entry_rpy(1)) * rad_to_deg > trotting_entry_tilt_limit_deg;
+                if (reject_trotting)
+                {
+                    ctrl_interfaces_.control_inputs_.command = 0; // 拒绝后须重新发起，避免姿态恢复时自动进入。
+                    next_state_ = current_state_;
+                    next_state_name_ = current_state_->state_name;
+                    RCLCPP_WARN(get_node()->get_logger(),
+                        "[PPO_TROTTING] entry rejected: actor_ready=%d, joints_valid=%d, contacts_ready=%d, "
+                        "roll=%.2f deg, pitch=%.2f deg, tilt_limit=%.1f deg; holding %s",
+                        state_list_.trotting->ready(), state_list_.trotting->jointFeedbackValid(), !contact_not_ready,
+                        entry_rpy(0) * rad_to_deg, entry_rpy(1) * rad_to_deg,
+                        trotting_entry_tilt_limit_deg, current_state_->state_name_string.c_str());
+                }
+            }
+            const bool reject_com_return = current_state_ == state_list_.comIdentification &&
+                next_state_ == state_list_.fixedStand &&
+                state_list_.comIdentification->checkChange() != FSMStateName::FIXEDSTAND;
+            if (reject_odometry || reject_imu || reject_trotting || reject_com_return)
+            {
+                current_state_->run(time, period);
+            }
+            else
+            {
+                RCLCPP_INFO(get_node()->get_logger(), "Switched from %s to %s",
+                            current_state_->state_name_string.c_str(), next_state_->state_name_string.c_str());
+                current_state_->exit();
+                current_state_ = next_state_;
+                if (current_state_ == state_list_.comIdentification)
+                    state_list_.comIdentification->setReturnTarget(state_list_.fixedStand->targetPosition());
+                current_state_->enter();
+            }
+            mode_ = FSMMode::NORMAL;
+        }
+
+        // Replace a failed walking command before the next hardware write.
+        if (current_state_ == state_list_.trotting && state_list_.trotting->faulted()) {
+            const bool use_passive = ctrl_interfaces_.control_inputs_.command == 1 ||
+                (current_state_ == state_list_.trotting && !state_list_.trotting->jointFeedbackValid());
+            auto stop_state = use_passive ?
+                std::shared_ptr<FSMState>(state_list_.passive) : std::shared_ptr<FSMState>(state_list_.fixedStand);
+            stop_state->previous_state_name = current_state_->state_name;
+            current_state_->exit(); current_state_ = next_state_ = stop_state;
+            next_state_name_ = current_state_->state_name; mode_ = FSMMode::NORMAL;
+            current_state_->enter(); current_state_->run(time, period);
+            RCLCPP_ERROR(get_node()->get_logger(), "[MPC_PPO] tracking stopped; command replaced by %s",
+                current_state_->state_name_string.c_str());
+        }
+        // ========== 发布关节目标位置（cmd_pos）镜像到 /joint_cmd_states ==========
+        if (joint_cmd_pub_) {
+            sensor_msgs::msg::JointState msg;
+            msg.header.stamp = time;
+            msg.name = joint_names_;
+            msg.position.resize(joint_names_.size());
+            for (size_t i = 0; i < joint_names_.size() && i < ctrl_interfaces_.joint_position_command_interface_.size(); ++i) {
+                msg.position[i] = ctrl_interfaces_.joint_position_command_interface_[i].get().get_value();
+            }
+            joint_cmd_pub_->publish(msg);
+        }
+
+        // 仿真诊断：所有 FSM 状态都可采集；50 Hz，无订阅者时不组装消息。
+        if (quadruped_debug::Csv_DebugMode && estimator_debug_pub_ &&
+            estimator_debug_pub_->get_subscription_count() > 0 &&
+            (last_estimator_debug_s_ < 0.0 || time.seconds() < last_estimator_debug_s_ ||
+             time.seconds() - last_estimator_debug_s_ >= 0.02 - 1e-9)) {
+            const auto& est = ctrl_component_.estimator_;
+            std_msgs::msg::Float64MultiArray msg;
+            msg.data.reserve(22);
+            msg.data = {time.seconds(), static_cast<double>(current_state_->state_name), period.seconds()};
+            const auto append = [&](const auto& values) {
+                for (int i = 0; i < values.size(); ++i) msg.data.push_back(values(i));
+            };
+            append(est->getPosition()); append(est->getVelocity());
+            append(est->debugAcceleration());
+            append(ctrl_component_.wave_generator_->contact_);
+            append(ctrl_component_.wave_generator_->phase_);
+            msg.data.push_back(est->debugDt());
+            msg.data.push_back(static_cast<double>(mode_));
+            msg.layout.dim.resize(1);
+            msg.layout.dim[0].label = "t,state,period,p_xyz,v_xyz,acc_G_xyz,planned_FR_FL_RR_RL,phase_FR_FL_RR_RL,estimator_dt,fsm_mode";
+            msg.layout.dim[0].size = msg.layout.dim[0].stride = static_cast<std::uint32_t>(msg.data.size());
+            estimator_debug_pub_->publish(msg);
+            last_estimator_debug_s_ = time.seconds();
+        }
+        return controller_interface::return_type::OK;
+    }
+
+    controller_interface::CallbackReturn Sysu219GuideController::on_init()
+    {
+        try
+        {
+            joint_names_ = auto_declare<std::vector<std::string>>("joints", joint_names_);
+            command_interface_types_ =
+                auto_declare<std::vector<std::string>>("command_interfaces", command_interface_types_);
+            state_interface_types_ =
+                auto_declare<std::vector<std::string>>("state_interfaces", state_interface_types_);
+
+            // imu sensor
+            imu_name_ = auto_declare<std::string>("imu_name", imu_name_);
+            base_name_ = auto_declare<std::string>("base_name", base_name_);
+            auto_declare<bool>("gazebo_com_visualization", false);
+            auto_declare<bool>("shadow_inekf_enabled", true);
+#ifdef SYSU219_ENABLE_CONTACT_SHADOW
+            auto_declare<std::string>("odometry_source", "inekf");
+#else
+            auto_declare<std::string>("odometry_source", "inekf");
+#endif
+            auto_declare<bool>("contact_feedback_control", false);
+            imu_interface_types_ = auto_declare<std::vector<std::string>>("imu_interfaces", state_interface_types_);
+            command_prefix_ = auto_declare<std::string>("command_prefix", command_prefix_);
+            feet_names_ =
+                auto_declare<std::vector<std::string>>("feet_names", feet_names_);
+
+            // pose parameters
+            prone_pos_ = auto_declare<std::vector<double>>("prone_pos", prone_pos_);
+            down_pos_ = auto_declare<std::vector<double>>("down_pos", down_pos_);
+            stand_pos_ = auto_declare<std::vector<double>>("stand_pos", stand_pos_);
+            stand_kp_ = auto_declare<double>("stand_kp", stand_kp_);
+            stand_kd_ = auto_declare<double>("stand_kd", stand_kd_);
+            prone_kp_ = auto_declare<double>("prone_kp", prone_kp_);
+            prone_kd_ = auto_declare<double>("prone_kd", prone_kd_);
+
+            // RLWALK: 1=AR002, 2=AR003, 3=AR002/8ms delay. Legacy models are disabled.
+            auto_declare<bool>("pure_gait_ppo", false);
+            auto_declare<bool>("smooth_gait_ppo", false);
+            auto_declare<bool>("gazebo_stand_only", false);
+            auto_declare<bool>("mpc_ppo_foot_tracking", false);
+            auto_declare<int>("rl_policy_id", 3);
+            auto_declare<double>("rl_pose_transition_s", 0.5);
+            auto_declare<double>("rl_entry_timeout_s", 5.0);
+            auto_declare<double>("rl_entry_tolerance_rad", 0.25);
+            auto_declare<double>("rl_entry_velocity_rad_s", 1.0);
+            auto_declare<double>("rl_max_control_period_s", 0.1);
+
+            // 姿态向量长度校验：三个姿态都必须恰好 12 个关节角，
+            // 否则各固定姿态状态里的 target_pos_[i] (i < 12) 会越界读
+            const auto check_pose_size = [this](const char* name, const std::vector<double>& pose)
+            {
+                if (pose.size() == 12)
+                {
+                    return true;
+                }
+                RCLCPP_ERROR(get_node()->get_logger(),
+                             "参数 %s 需要 12 个关节角（FR/FL/RR/RL × hip/thigh/calf），当前 %zu 个",
+                             name, pose.size());
+                return false;
+            };
+
+            if (!check_pose_size("prone_pos", prone_pos_)
+                || !check_pose_size("down_pos", down_pos_)
+                || !check_pose_size("stand_pos", stand_pos_))
+            {
+                return controller_interface::CallbackReturn::ERROR;
+            }
+
+            get_node()->get_parameter("update_rate", ctrl_interfaces_.frequency_);
+            RCLCPP_INFO(get_node()->get_logger(), "Controller Manager Update Rate: %d Hz", ctrl_interfaces_.frequency_);
+
+            ctrl_component_.estimator_ = std::make_shared<Estimator>(ctrl_interfaces_, ctrl_component_);
+        }
+        catch (const std::exception& e)
+        {
+            fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
+            return controller_interface::CallbackReturn::ERROR;
+        }
+
+#ifdef SYSU219_ENABLE_CONTACT_SHADOW
+        // 可选参数也必须隔离：黄色参数类型错误不能使原控制器初始化失败。
+        try {
+            auto_declare<bool>("contact_shadow_inekf_enabled", true);
+            auto_declare<double>("contact_shadow_force_on_N", 25.0);
+            auto_declare<double>("contact_shadow_force_off_N", 12.0);
+            auto_declare<double>("contact_shadow_confirm_on_s", 0.012);
+            auto_declare<double>("contact_shadow_confirm_off_s", 0.020);
+            auto_declare<bool>("contact_shadow_write_csv", true);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(get_node()->get_logger(), "[CONTACT_SHADOW] optional parameters invalid; red unchanged: %s", e.what());
+        } catch (...) {
+            RCLCPP_ERROR(get_node()->get_logger(), "[CONTACT_SHADOW] optional parameter failure; red unchanged");
+        }
+#endif
+        return CallbackReturn::SUCCESS;
+    }
+
+    controller_interface::CallbackReturn Sysu219GuideController::on_configure(
+        const rclcpp_lifecycle::State& /*previous_state*/)
+    {
+        odometry_source_ = get_node()->get_parameter("odometry_source").as_string();
+        if (odometry_source_ != "legacy_kf" && odometry_source_ != "inekf" && odometry_source_ != "contact_inekf") {
+            RCLCPP_ERROR(get_node()->get_logger(), "odometry_source只能为legacy_kf / inekf / contact_inekf");
+            return CallbackReturn::ERROR;
+        }
+#ifndef SYSU219_ENABLE_CONTACT_SHADOW
+        if (odometry_source_ == "contact_inekf") {
+            RCLCPP_ERROR(get_node()->get_logger(), "当前构建未包含contact_inekf，请选择inekf或legacy_kf");
+            return CallbackReturn::ERROR;
+        }
+#endif
+        ctrl_component_.odometry_mode = odometry_source_ == "legacy_kf" ? 0 : odometry_source_ == "inekf" ? 1 : 2;
+        ctrl_component_.contact_feedback_enabled = ctrl_component_.odometry_mode == 2 &&
+            get_node()->get_parameter("contact_feedback_control").as_bool();
+        gazebo_stand_only_ = get_node()->get_parameter("gazebo_stand_only").as_bool();
+        pure_gait_ppo_ = get_node()->get_parameter("pure_gait_ppo").as_bool();
+        smooth_gait_ppo_ = get_node()->get_parameter("smooth_gait_ppo").as_bool();
+        if (smooth_gait_ppo_ && (!pure_gait_ppo_ || gazebo_stand_only_ || odometry_source_ != "inekf"
+                || ctrl_interfaces_.frequency_ != 250)) {
+            RCLCPP_ERROR(get_node()->get_logger(), "Smooth PPO requires pure gait mode, InEKF and a 250 Hz main controller");
+            return CallbackReturn::ERROR;
+        }
+        if (gazebo_stand_only_ && !get_node()->get_parameter("use_sim_time").as_bool()) {
+            RCLCPP_ERROR(get_node()->get_logger(), "gazebo_stand_only requires simulation time");
+            return CallbackReturn::ERROR;
+        }
+        ctrl_component_.convex_mpc_.reset();
+        ctrl_component_.balance_ctrl_.reset();
+        if (legacyStatesEnabled()) {
+            ctrl_component_.convex_mpc_ = std::make_shared<ConvexMpcSolver>();
+        }
+        // 可选影子观测器：初始化失败时仅停用该模块，主控制器继续运行。
+        shadow_inekf_.reset();
+        if (ctrl_component_.odometry_mode == 1 || get_node()->get_parameter("shadow_inekf_enabled").as_bool()) {
+            try {
+                shadow_inekf_ = std::make_shared<ShadowInEKF>(
+                    joint_names_, feet_names_, base_name_, imu_name_);
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(get_node()->get_logger(), "[SHADOW_INEKF] disabled: %s", e.what());
+            }
+        }
+        contact_shadow_inekf_.reset();
+#ifdef SYSU219_ENABLE_CONTACT_SHADOW
+        try {
+            if (ctrl_component_.odometry_mode == 2 || get_node()->get_parameter("contact_shadow_inekf_enabled").as_bool()) {
+                ContactShadowInEKF::Settings settings;
+                settings.serve_odometry = ctrl_component_.odometry_mode == 2;
+                settings.force_on_N = get_node()->get_parameter("contact_shadow_force_on_N").as_double();
+                settings.force_off_N = get_node()->get_parameter("contact_shadow_force_off_N").as_double();
+                settings.confirm_on_s = get_node()->get_parameter("contact_shadow_confirm_on_s").as_double();
+                settings.confirm_off_s = get_node()->get_parameter("contact_shadow_confirm_off_s").as_double();
+                settings.write_csv = get_node()->get_parameter("contact_shadow_write_csv").as_bool();
+                contact_shadow_inekf_ = std::make_shared<ContactShadowInEKF>(
+                    joint_names_, feet_names_, base_name_, imu_name_, settings);
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(get_node()->get_logger(), "[CONTACT_SHADOW] disabled; serving loop unchanged: %s", e.what());
+        } catch (...) {
+            RCLCPP_ERROR(get_node()->get_logger(), "[CONTACT_SHADOW] disabled after unknown exception; serving loop unchanged");
+        }
+#endif
+        if ((ctrl_component_.odometry_mode == 1 && !shadow_inekf_) ||
+            (ctrl_component_.odometry_mode == 2 && !contact_shadow_inekf_)) {
+            RCLCPP_ERROR(get_node()->get_logger(), "所选估计器%s构造失败，拒绝配置；不静默换源", odometry_source_.c_str());
+            return CallbackReturn::ERROR;
+        }
+        RCLCPP_INFO(get_node()->get_logger(), "[ODOMETRY_SELECT] source=%s contact_feedback=%d (重新配置后生效)",
+            odometry_source_.c_str(), ctrl_component_.contact_feedback_enabled);
+        control_input_subscription_ = get_node()->create_subscription<control_input_msgs::msg::Inputs>(
+            "/control_input", 10, [this](const control_input_msgs::msg::Inputs::SharedPtr msg)
+            {
+                // Handle message
+                ctrl_interfaces_.control_inputs_.command = msg->command;
+                ctrl_interfaces_.control_inputs_.lx = msg->lx;
+                ctrl_interfaces_.control_inputs_.ly = msg->ly;
+                ctrl_interfaces_.control_inputs_.rx = msg->rx;
+                ctrl_interfaces_.control_inputs_.ry = msg->ry;
+            });
+
+        robot_description_subscription_ = get_node()->create_subscription<std_msgs::msg::String>(
+            "/robot_description", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local(),
+            [this](const std_msgs::msg::String::SharedPtr msg)
+            {
+                ctrl_component_.robot_model_ = std::make_shared<QuadrupedRobot>(
+                    ctrl_interfaces_, msg->data, feet_names_, base_name_);
+                if (legacyStatesEnabled())
+                    ctrl_component_.balance_ctrl_ = std::make_shared<BalanceCtrl>(ctrl_component_.robot_model_);
+                if (shadow_inekf_) {
+                    try { shadow_inekf_->setRobotDescription(msg->data); }
+                    catch (const std::exception& e) {
+                        RCLCPP_ERROR(get_node()->get_logger(), "[SHADOW_INEKF] description rejected: %s", e.what());
+                    }
+                }
+#ifdef SYSU219_ENABLE_CONTACT_SHADOW
+                if (contact_shadow_inekf_) {
+                    try { contact_shadow_inekf_->setRobotDescription(msg->data); }
+                    catch (const std::exception& e) {
+                        RCLCPP_ERROR(get_node()->get_logger(), "[CONTACT_SHADOW] description rejected; red unchanged: %s", e.what());
+                    } catch (...) {
+                        contact_shadow_inekf_->stopSession();
+                        RCLCPP_ERROR(get_node()->get_logger(), "[CONTACT_SHADOW] description rejected; yellow inactive, red unchanged");
+                    }
+                }
+#endif
+            });
+
+        // 摆动保持 0.325 s，支撑加倍为 0.650 s；每次对角交接四足支撑 0.1625 s。
+        ctrl_component_.wave_generator_ = std::make_shared<WaveGenerator>(0.975, 2.0 / 3.0, Vec4(0, 0.5, 0.5, 0));
+
+        return CallbackReturn::SUCCESS;
+    }
+
+    controller_interface::CallbackReturn
+    Sysu219GuideController::on_activate(const rclcpp_lifecycle::State& /*previous_state*/)
+    {
+        // ========== 1. 【关键修改】最先赋值 node ==========
+        ctrl_interfaces_.node = get_node(); // <-- 移到最前面！
+        estimator_debug_pub_.reset();
+        last_estimator_debug_s_ = -1.0;
+        if (legacyStatesEnabled() && quadruped_debug::Csv_DebugMode && get_node()->get_parameter("use_sim_time").as_bool())
+            estimator_debug_pub_ = get_node()->create_publisher<std_msgs::msg::Float64MultiArray>(
+                "/estimator_debug", rclcpp::SensorDataQoS());
+        com_estimated_pub_.reset();
+        last_com_publish_s_ = -1.0;
+        if (legacyStatesEnabled() && get_node()->get_parameter("gazebo_com_visualization").as_bool() &&
+            get_node()->get_parameter("use_sim_time").as_bool()) {
+            com_estimated_pub_ = get_node()->create_publisher<geometry_msgs::msg::PointStamped>(
+                "/com_estimated", rclcpp::QoS(1));
+        }
+        ctrl_interfaces_.body_debug_pub = ctrl_interfaces_.node->create_publisher<std_msgs::msg::Float64MultiArray>("/body_debug", 10);
+        joint_cmd_pub_ = ctrl_interfaces_.node->create_publisher<sensor_msgs::msg::JointState>("/joint_cmd_states", 10);
+        tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(get_node());
+        // clear out vectors in case of restart
+        ctrl_interfaces_.clear();
+
+        // assign command interfaces
+        for (auto& interface : command_interfaces_)
+        {
+            std::string interface_name = interface.get_interface_name();
+            if (const size_t pos = interface_name.find('/'); pos != std::string::npos)
+            {
+                command_interface_map_[interface_name.substr(pos + 1)]->push_back(interface);
+            }
+            else
+            {
+                command_interface_map_[interface_name]->push_back(interface);
+            }
+        }
+
+        // ALL接口的返回顺序不作为关节顺序；基础控制接口仍严格按原配置绑定。
+        auto bind_state = [&](const std::string& name, auto& destination) {
+            for (auto& interface : state_interfaces_) {
+                if (interface.get_name() == name) {
+                    destination.emplace_back(interface);
+                    return true;
+                }
+            }
+            RCLCPP_ERROR(get_node()->get_logger(), "缺少必需状态接口：%s", name.c_str());
+            return false;
+        };
+        for (const auto& joint_name : joint_names_) {
+            for (const auto& type : state_interface_types_) {
+                const auto mapping = state_interface_map_.find(type);
+                if (mapping == state_interface_map_.end() || !mapping->second ||
+                    !bind_state(joint_name + "/" + type, *mapping->second))
+                    return CallbackReturn::ERROR;
+            }
+        }
+        for (const auto& type : imu_interface_types_)
+            if (!bind_state(imu_name_ + "/" + type, ctrl_interfaces_.imu_state_interface_))
+                return CallbackReturn::ERROR;
+
+        // 附加传感器不混入原控制向量。名称匹配只在激活阶段执行，不占控制周期。
+        for (const auto& interface : state_interfaces_) {
+            if (interface.get_prefix_name() != "hw_debug") continue;
+            const auto name = interface.get_interface_name();
+            for (size_t joint = 0; joint < std::min<size_t>(joint_names_.size(), 12); ++joint)
+                for (size_t field = 0; field < TrottingDebug::motor_debug_fields.size(); ++field)
+                    if (name == joint_names_[joint] + "." + TrottingDebug::motor_debug_fields[field])
+                        ctrl_interfaces_.motor_debug_state_interfaces_[joint][field] = &interface;
+            for (size_t field = 0; field < TrottingDebug::imu_debug_fields.size(); ++field)
+                if (name == std::string("imu.") + TrottingDebug::imu_debug_fields[field])
+                    ctrl_interfaces_.imu_debug_state_interfaces_[field] = &interface;
+        }
+
+        if (legacyStatesEnabled() && quadruped_debug::Csv_DebugMode) {
+            const auto& positions = ctrl_interfaces_.joint_position_state_interface_;
+            const auto& velocities = ctrl_interfaces_.joint_velocity_state_interface_;
+            const auto& efforts = ctrl_interfaces_.joint_effort_state_interface_;
+            size_t hardware_debug_count = 0;
+            for (const auto& joint : ctrl_interfaces_.motor_debug_state_interfaces_)
+                for (const auto* interface : joint) if (interface) ++hardware_debug_count;
+            for (const auto* interface : ctrl_interfaces_.imu_debug_state_interfaces_)
+                if (interface) ++hardware_debug_count;
+            RCLCPP_INFO(get_node()->get_logger(),
+                "[SOURCE_DEBUG] hardware_interfaces=%zu/120; missing fields recorded as NaN",
+                hardware_debug_count);
+            RCLCPP_INFO(get_node()->get_logger(), "[JOINT_DEBUG] position_count=%zu velocity_count=%zu effort_count=%zu",
+                positions.size(), velocities.size(), efforts.size());
+            for (size_t i = 0; i < std::min(positions.size(), velocities.size()); ++i) {
+                const std::string effort_name = i < efforts.size() ? efforts[i].get().get_name() : "missing";
+                RCLCPP_INFO(get_node()->get_logger(), "[JOINT_DEBUG] index=%zu position=%s velocity=%s effort=%s",
+                    i, positions[i].get().get_name().c_str(), velocities[i].get().get_name().c_str(), effort_name.c_str());
+            }
+        }
+
+        // Create FSM List
+        ctrl_component_.estimator_->selectInEKF(ctrl_component_.odometry_mode != 0);
+        last_odometry_ready_ = false;
+        ctrl_component_.contact_observation_ready = false;
+        if (shadow_inekf_) {
+            try { shadow_inekf_->startSession(ctrl_interfaces_); }
+            catch (const std::exception& e) {
+                RCLCPP_ERROR(get_node()->get_logger(), "[SHADOW_INEKF] inactive: %s", e.what());
+                if (ctrl_component_.odometry_mode == 1) return CallbackReturn::ERROR;
+            }
+        }
+#ifdef SYSU219_ENABLE_CONTACT_SHADOW
+        if (contact_shadow_inekf_) {
+            try { contact_shadow_inekf_->startSession(ctrl_interfaces_); }
+            catch (const std::exception& e) {
+                contact_shadow_inekf_->stopSession();
+                RCLCPP_ERROR(get_node()->get_logger(), "[CONTACT_SHADOW] inactive: %s", e.what());
+                if (ctrl_component_.odometry_mode == 2) return CallbackReturn::ERROR;
+            } catch (...) {
+                contact_shadow_inekf_->stopSession();
+                RCLCPP_ERROR(get_node()->get_logger(), "[CONTACT_SHADOW] inactive after unknown exception");
+                if (ctrl_component_.odometry_mode == 2) return CallbackReturn::ERROR;
+            }
+        }
+#endif
+        state_list_ = {};
+        state_list_.passive = std::make_shared<StatePassive>(ctrl_interfaces_);
+        state_list_.fixedProne = std::make_shared<StateFixedProne>(ctrl_interfaces_, prone_pos_, prone_kp_, prone_kd_);
+        state_list_.fixedDown = std::make_shared<StateFixedDown>(ctrl_interfaces_, down_pos_, stand_kp_, stand_kd_);
+        state_list_.fixedStand = std::make_shared<StateFixedStand>(ctrl_interfaces_, stand_pos_, stand_kp_, stand_kd_);
+        if (!gazebo_stand_only_) {
+            state_list_.trotting = std::make_shared<StateTrotting>(
+                ctrl_interfaces_, ctrl_component_, pure_gait_ppo_, smooth_gait_ppo_);
+            if (smooth_gait_ppo_ && !state_list_.trotting->ready()) {
+                RCLCPP_ERROR(get_node()->get_logger(), "Could not load the 74-input smooth PPO controller");
+                return CallbackReturn::ERROR;
+            }
+        }
+        if (legacyStatesEnabled()) {
+            state_list_.swingTest = std::make_shared<StateSwingTest>(ctrl_interfaces_, ctrl_component_);
+            state_list_.freeStand = std::make_shared<StateFreeStand>(ctrl_interfaces_, ctrl_component_);
+            state_list_.balanceTest = std::make_shared<StateBalanceTest>(ctrl_interfaces_, ctrl_component_);
+            state_list_.rlWalk = std::make_shared<StateRLWalk>(ctrl_interfaces_, ctrl_component_);
+            try {
+                state_list_.legIdentification = std::make_shared<StateLegIdentification>(
+                    ctrl_interfaces_, joint_names_, stand_pos_, stand_kp_, stand_kd_);
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(get_node()->get_logger(),
+                    "[LEG_ID] 辨识模块初始化失败，已停用该模块，原有FSM继续启动：%s", e.what());
+            }
+            try {
+                state_list_.comIdentification = std::make_shared<StateComIdentification>(
+                    ctrl_interfaces_, ctrl_component_, joint_names_, stand_pos_, base_name_, feet_names_);
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(get_node()->get_logger(), "[COM_ID] 已停用质心辨识，原FSM不受影响：%s", e.what());
+            }
+        }
+
+        // Initialize FSM
+        current_state_ = state_list_.passive;
+        current_state_->enter();
+        next_state_ = current_state_;
+        next_state_name_ = current_state_->state_name;
+        mode_ = FSMMode::NORMAL;
+
+
+        // ctrl_interfaces_.node = get_node(); // 将节点指针传递给 CtrlInterfaces 以供 FSM 状态使用
+        return CallbackReturn::SUCCESS;
+    }
+
+    controller_interface::CallbackReturn Sysu219GuideController::on_deactivate(
+        const rclcpp_lifecycle::State& /*previous_state*/)
+    {
+        if (shadow_inekf_) shadow_inekf_->stopSession();
+#ifdef SYSU219_ENABLE_CONTACT_SHADOW
+        if (contact_shadow_inekf_) contact_shadow_inekf_->stopSession();
+#endif
+        if (current_state_ && (current_state_ == state_list_.legIdentification ||
+            current_state_ == state_list_.comIdentification || current_state_ == state_list_.trotting))
+            current_state_->exit();
+        current_state_.reset();
+        next_state_.reset();
+        state_list_ = {};
+        estimator_debug_pub_.reset();
+        com_estimated_pub_.reset();
+        release_interfaces();
+        return CallbackReturn::SUCCESS;
+    }
+
+    controller_interface::CallbackReturn
+    Sysu219GuideController::on_cleanup(const rclcpp_lifecycle::State& /*previous_state*/)
+    {
+        if (shadow_inekf_) shadow_inekf_->stopSession();
+#ifdef SYSU219_ENABLE_CONTACT_SHADOW
+        if (contact_shadow_inekf_) contact_shadow_inekf_->stopSession();
+#endif
+        return CallbackReturn::SUCCESS;
+    }
+
+    controller_interface::CallbackReturn
+    Sysu219GuideController::on_error(const rclcpp_lifecycle::State& /*previous_state*/)
+    {
+        if (shadow_inekf_) shadow_inekf_->stopSession();
+#ifdef SYSU219_ENABLE_CONTACT_SHADOW
+        if (contact_shadow_inekf_) contact_shadow_inekf_->stopSession();
+#endif
+        return CallbackReturn::SUCCESS;
+    }
+
+    controller_interface::CallbackReturn
+    Sysu219GuideController::on_shutdown(const rclcpp_lifecycle::State& /*previous_state*/)
+    {
+        if (shadow_inekf_) shadow_inekf_->stopSession();
+#ifdef SYSU219_ENABLE_CONTACT_SHADOW
+        if (contact_shadow_inekf_) contact_shadow_inekf_->stopSession();
+#endif
+        return CallbackReturn::SUCCESS;
+    }
+
+    std::shared_ptr<FSMState> Sysu219GuideController::getNextState(const FSMStateName stateName) const
+    {
+        switch (stateName)
+        {
+        case FSMStateName::INVALID:
+            return state_list_.invalid;
+        case FSMStateName::PASSIVE:
+            return state_list_.passive;
+        case FSMStateName::LEGIDENTIFICATION:
+            return state_list_.legIdentification;
+        case FSMStateName::COMIDENTIFICATION:
+            return state_list_.comIdentification;
+        case FSMStateName::FIXEDPRONE:
+            return state_list_.fixedProne;
+        case FSMStateName::FIXEDDOWN:
+            return state_list_.fixedDown;
+        case FSMStateName::FIXEDSTAND:
+            return state_list_.fixedStand;
+        case FSMStateName::FREESTAND:
+            return state_list_.freeStand;
+        case FSMStateName::TROTTING:
+            return state_list_.trotting;
+        case FSMStateName::SWINGTEST:
+            return state_list_.swingTest;
+        case FSMStateName::BALANCETEST:
+            return state_list_.balanceTest;
+        case FSMStateName::RLWALK:
+            return state_list_.rlWalk;
+        default:
+            return state_list_.invalid;
+        }
+    }
+}
+
+#include "pluginlib/class_list_macros.hpp"
+PLUGINLIB_EXPORT_CLASS(sysu219_guide_controller::Sysu219GuideController, controller_interface::ControllerInterface);
