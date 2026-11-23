@@ -1,9 +1,9 @@
 {
   "checkpoint": "model_725.pt",
-  "checkpoint_sha256": "f239a2e35c65a99fec74029254b8dba3aa00b7a3e2430dfcdbf3df42b4cba2b3",
+  "checkpoint_sha256": "d68847d6e41f9856176e6571c757c4f55d84a26145eb38a66743653d8b848cac",
   "contract": {
-    "id": "sysu219.pure_hybrid_gait74.v1",
-    "observation_width": 74,
+    "id": "sysu219.pure_hybrid_gait77.v1",
+    "observation_width": 77,
     "actor_joint_order": [
       "FL_hip_joint",
       "FR_hip_joint",
@@ -26,7 +26,8 @@
       "joint_vel",
       "actions",
       "local_gait_reference",
-      "odometry_position_delta"
+      "odometry_position_delta",
+      "odometry_linear_velocity"
     ],
     "velocity_frame": "body",
     "gravity": "world negative unit Z expressed in body frame",
@@ -172,10 +173,19 @@
       "units": "m",
       "anchor": "first accepted odometry pose at gait entry",
       "frame": "entry odometry heading axes in XY and world Z"
+    },
+    "odometry_linear_velocity": {
+      "order": [
+        "vx",
+        "vy",
+        "vz"
+      ],
+      "units": "m/s",
+      "frame": "current odometry heading axes in XY and world Z"
     }
   },
-  "contract_sha256": "3320576f27f15e63d83b01b13b0f743e3f9c46b4e626a0e8adff40fc345c6d48",
-  "onnx_sha256": "63058523ca3935d9e768782ac65a5063fce9d018530f2247583a3b64dd6692b9",
-  "onnx_reference_vs_torch_max_abs": 1.5497207641601562e-06,
-  "run": "2026-11-24_02-50-37"
+  "contract_sha256": "4e59ccf367ca6e9de22f18127448059f482187b8da137e26ea765398bc2b61bc",
+  "onnx_sha256": "474185b81fbd0d29449e4556fbfedf441222a59e291395e92ffe82af41f2f3c0",
+  "onnx_reference_vs_torch_max_abs": 9.5367431640625e-07,
+  "run": "2026-11-24_04-03-57"
 }

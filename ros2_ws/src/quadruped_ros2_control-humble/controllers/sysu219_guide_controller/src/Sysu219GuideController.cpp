@@ -795,7 +795,7 @@ namespace sysu219_guide_controller
                 ctrl_interfaces_, ctrl_component_, pure_gait_ppo_, smooth_gait_ppo_, local_gait_ppo_, hybrid_gait_ppo_);
             if ((smooth_gait_ppo_ || local_gait_ppo_ || hybrid_gait_ppo_) && !state_list_.trotting->ready()) {
                 RCLCPP_ERROR(get_node()->get_logger(), "Could not load the %s PPO controller",
-                             hybrid_gait_ppo_ ? "74-input hybrid" : local_gait_ppo_ ? "71-input local" : "74-input smooth");
+                             hybrid_gait_ppo_ ? "hybrid" : local_gait_ppo_ ? "71-input local" : "74-input smooth");
                 return CallbackReturn::ERROR;
             }
             if (hybrid_gait_ppo_)

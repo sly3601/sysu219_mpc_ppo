@@ -92,6 +92,8 @@ ros2 run keyboard_input keyboard_input
 
 真机和 Gazebo 在 `policy:=hybrid` 下，从本工程的 `ros2_ws/install/sysu219_guide_controller/share/sysu219_guide_controller/model/` 加载 `pure_hybrid_gait_ppo.onnx` 和同名 JSON。控制器启动日志会打印检查点 SHA，当前检查点轮次和文件校验值见 [v4 模型清单](ros2_ws/src/quadruped_ros2_control-humble/controllers/sysu219_guide_controller/model/pure_hybrid_gait_ppo.json)。
 
+带 InEKF 速度观测的 v4 策略为 77 维，在原有 74 维输入末尾追加三轴速度。从 74 维版本更新时，按本文已有的构建命令重新构建 ROS 2 控制器，再重新加载工作区。两个版本均使用 `policy:=hybrid`。
+
 ## 维护
 
 本工程的构建命令、环境加载或启动参数有变化时，同步更新本 README。

@@ -187,8 +187,8 @@ void StateTrotting::run(const rclcpp::Time& time, const rclcpp::Duration& period
         auto& estimator = *components_.estimator_;
         auto& wave = *components_.wave_generator_;
         if (hybrid_gait_) {
-            if (!tracker_.stepHybrid(dt, requestedVelocityBody(), estimator.getPosition(), estimator.getYaw(),
-                                     gait_elapsed_ns_, wave)) {
+            if (!tracker_.stepHybrid(dt, requestedVelocityBody(), estimator.getPosition(), estimator.getVelocity(),
+                                     estimator.getYaw(), gait_elapsed_ns_, wave)) {
                 fail("hybrid gait actor rejected synchronized phase, odometry or action");
                 return;
             }

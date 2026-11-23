@@ -30,7 +30,8 @@ public:
                     const Eigen::Vector3d& commandBody, const SmoothGaitReference::Measurement& measurement);
     bool stepLocal(double dt, const Eigen::Vector3d& commandBody);
     bool stepHybrid(double dt, const Eigen::Vector3d& commandBody, const Eigen::Vector3d& positionWorld,
-                    double yawWorld, std::int64_t gaitElapsedNs, const WaveGenerator& wave);
+                    const Eigen::Vector3d& velocityWorld, double yawWorld,
+                    std::int64_t gaitElapsedNs, const WaveGenerator& wave);
 
 private:
     struct Impl;

@@ -46,15 +46,20 @@ def require_pure_policy(model_dir, kind='pure'):
         info = json.loads(manifest.read_text(encoding='utf-8'))
         contract = info['contract']
         contract_bytes = json.dumps(contract, separators=(',', ':'), sort_keys=True).encode()
-        valid = (contract['id'] == contract_id and contract['observation_width'] == width
+        identity = (contract['id'], contract['observation_width'])
+        expected_identity = (contract_id, width)
+        if kind == 'hybrid':
+            accepted = {
+                'ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825': (contract_id, width),
+                '3320576f27f15e63d83b01b13b0f743e3f9c46b4e626a0e8adff40fc345c6d48': (contract_id, width),
+                '9f517ad3d0bf8e566e2d365d17c1a3a455db3c4c644ad8711d7eedbb0403c055': ('sysu219.pure_hybrid_gait77.v1', 77),
+                '4e59ccf367ca6e9de22f18127448059f482187b8da137e26ea765398bc2b61bc': ('sysu219.pure_hybrid_gait77.v1', 77),
+            }
+            expected_identity = accepted.get(info['contract_sha256'])
+        valid = (identity == expected_identity
                  and contract['kp'] == [260.0] * 12 and contract['kd'] == [3.8] * 12
                  and hashlib.sha256(contract_bytes).hexdigest() == info['contract_sha256']
                  and hashlib.sha256(model.read_bytes()).hexdigest() == info['onnx_sha256'])
-        if kind == 'hybrid':
-            valid = valid and info['contract_sha256'] in {
-                'ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825',  # 975 ms, 2/3 support
-                '3320576f27f15e63d83b01b13b0f743e3f9c46b4e626a0e8adff40fc345c6d48',  # 650 ms, 1/2 support
-            }
     except (KeyError, TypeError, ValueError) as error:
         raise RuntimeError(f'无法读取纯 PPO 导出清单：{manifest}') from error
     if not valid:

@@ -34,11 +34,16 @@ constexpr char kSmoothGaitContract[] = "98238c0bf8f22c9f2f9551f4a1c56e0f3881c6c5
 constexpr char kLocalGaitContract[] = "f099e8b4e74eaf6f0b0c2df1aeae13329ef02cab8a75904f5a619583f36bb38c";
 constexpr char kHybridGaitContract[] = "ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825";
 constexpr char kDiagonalHybridGaitContract[] = "3320576f27f15e63d83b01b13b0f743e3f9c46b4e626a0e8adff40fc345c6d48";
+constexpr char kHybridVelocityGaitId[] = "sysu219.pure_hybrid_gait77.v1";
+constexpr char kHybridVelocityGaitContract[] = "9f517ad3d0bf8e566e2d365d17c1a3a455db3c4c644ad8711d7eedbb0403c055";
+constexpr char kDiagonalHybridVelocityGaitContract[] = "4e59ccf367ca6e9de22f18127448059f482187b8da137e26ea765398bc2b61bc";
 constexpr char kFlatCheckpoint[] = "5d16c702b3bba579830968f16c85722dbb06d75e7f1b6efd922fef3010363228";
 constexpr char kFlatContract[] = "e0f63c48ba5536a61af412bffd122f650b3a18fed27b0f3210f9465d61c8d4ba";
 constexpr char kTrackingContract[] = "930d512bfd01635766017ffa1368a462b5c42879b034827256b82d815737dd65";
 constexpr std::size_t kProprioceptionWidth = 45;  // All feedback and past actions except base linear velocity.
 constexpr std::size_t kLocalGaitWidth = kProprioceptionWidth + 26;
+constexpr std::size_t kHybridPositionWidth = kLocalGaitWidth + 3;
+constexpr std::size_t kHybridVelocityWidth = kHybridPositionWidth + 3;
 
 struct PolicySpec {
     const char* model;
@@ -63,7 +68,8 @@ PolicySpec policyFor(FlatPpoTracker::Mode mode) {
         case Mode::LocalGait:
             return {"pure_local_gait_ppo.onnx", "sysu219.pure_local_gait71.v1", kLocalGaitContract, 71, true, true};
         case Mode::HybridGait:
-            return {"pure_hybrid_gait_ppo.onnx", "sysu219.pure_hybrid_gait74.v1", kHybridGaitContract, 74, true, true};
+            return {"pure_hybrid_gait_ppo.onnx", "sysu219.pure_hybrid_gait74.v1",
+                    kHybridGaitContract, kHybridPositionWidth, true, true};
     }
     throw std::invalid_argument("Unknown PPO deployment mode");
 }
@@ -111,27 +117,28 @@ struct FlatPpoTracker::Impl {
     };
     struct HybridMeasurement {
         const Eigen::Vector3d& position;
+        const Eigen::Vector3d& velocity;
         double yaw;
         std::int64_t elapsed_ns;
         const WaveGenerator& wave;
     };
     CtrlInterfaces& io;
     const Mode mode;
-    const PolicySpec policy;
+    PolicySpec policy;
     std::array<Joint, 12> joints{};
     std::array<hardware_interface::LoanedStateInterface*, 7> imu{};
     std::array<double, 12> startPos{}, startKp{}, startKd{}, goal{};
     std::array<double, 12> firstPole{}, smoothedPos{};
     SmoothGaitReference smoothReference;
     LocalGaitReference localReference;
-    std::array<float, 74> obs{};
+    std::array<float, kHybridVelocityWidth> obs{};
     std::array<float, 12> raw{};
     Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "sysu219_mpc_ppo"};
     Ort::MemoryInfo memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     std::unique_ptr<Ort::Session> session;
     Ort::Value input{nullptr}, output{nullptr};
     bool started = false, fault = false, inferred = false;
-    bool equal_hybrid_phases = false;
+    bool equal_hybrid_phases = false, hybrid_velocity = false;
     double elapsed = 0., sinceInference = 0., blend = 0.;
     double sinceHostTick = 0.;
     std::int64_t nextHybridPolicyNs = 0, previousHybridPolicyNs = 0;
@@ -174,7 +181,6 @@ struct FlatPpoTracker::Impl {
         session = std::make_unique<Ort::Session>(env, path.c_str(), options);
         if (session->GetInputCount() != 1 || session->GetOutputCount() != 1)
             throw std::runtime_error("Actor must have a single input and output");
-        checkTensor(session->GetInputTypeInfo(0), policy.width);
         checkTensor(session->GetOutputTypeInfo(0), 12);
         Ort::AllocatorWithDefaultOptions allocator;
         if (std::string(session->GetInputNameAllocated(0, allocator).get()) != "obs" ||
@@ -183,12 +189,21 @@ struct FlatPpoTracker::Impl {
         const auto meta = session->GetModelMetadata();
         const auto sha = metadata(meta, "sysu219.checkpoint_sha256");
         const auto fingerprint = metadata(meta, "sysu219.contract_sha256");
-        equal_hybrid_phases = mode == Mode::HybridGait && fingerprint == kDiagonalHybridGaitContract;
-        if (metadata(meta, "sysu219.contract_id") != policy.id ||
+        const auto contract = metadata(meta, "sysu219.contract_id");
+        hybrid_velocity = mode == Mode::HybridGait && contract == kHybridVelocityGaitId;
+        if (hybrid_velocity) {
+            policy.id = kHybridVelocityGaitId;
+            policy.fingerprint = kHybridVelocityGaitContract;
+            policy.width = kHybridVelocityWidth;
+        }
+        equal_hybrid_phases = mode == Mode::HybridGait && fingerprint ==
+            (hybrid_velocity ? kDiagonalHybridVelocityGaitContract : kDiagonalHybridGaitContract);
+        if (contract != policy.id ||
             (fingerprint != policy.fingerprint && !equal_hybrid_phases) ||
             sha.size() != 64 || sha.find_first_not_of("0123456789abcdef") != std::string::npos ||
             (mode == Mode::FlatMpc && sha != kFlatCheckpoint))
             throw std::runtime_error("Wrong SYSU219 deployment contract or checkpoint");
+        checkTensor(session->GetInputTypeInfo(0), policy.width);
         const std::array<int64_t, 2> inShape{1, policy.width}, outShape{1, 12};
         input = Ort::Value::CreateTensor<float>(memory, obs.data(), policy.width, inShape.data(), 2);
         output = Ort::Value::CreateTensor<float>(memory, raw.data(), raw.size(), outShape.data(), 2);
@@ -221,6 +236,7 @@ struct FlatPpoTracker::Impl {
                 throw std::runtime_error("Invalid estimated state for smooth PPO");
         }
         if (mode == Mode::HybridGait && (!hybrid || !hybrid->position.allFinite() ||
+                (hybrid_velocity && !hybrid->velocity.allFinite()) ||
                 !std::isfinite(hybrid->yaw) || hybrid->elapsed_ns < 0 ||
                 (!started && hybrid->elapsed_ns != 0) ||
                 (started && hybrid->elapsed_ns < previousHybridHostNs))) {
@@ -332,6 +348,14 @@ struct FlatPpoTracker::Impl {
             obs[kLocalGaitWidth] = static_cast<float>(hybridHeading.dot(delta.head<2>()));
             obs[kLocalGaitWidth + 1] = static_cast<float>(-hybridHeading.y() * delta.x() + hybridHeading.x() * delta.y());
             obs[kLocalGaitWidth + 2] = static_cast<float>(delta.z());
+            if (hybrid_velocity) {
+                // Match the actor's current odometry heading frame for XY and world Z.
+                const double c = std::cos(hybrid->yaw), s = std::sin(hybrid->yaw);
+                const auto& v = hybrid->velocity;
+                obs[kHybridPositionWidth] = static_cast<float>(c * v.x() + s * v.y());
+                obs[kHybridPositionWidth + 1] = static_cast<float>(-s * v.x() + c * v.y());
+                obs[kHybridPositionWidth + 2] = static_cast<float>(v.z());
+            }
             previousHybridPolicyNs = hybrid->elapsed_ns;
             nextHybridPolicyNs = (hybrid->elapsed_ns / kPolicyPeriodNs + 1) * kPolicyPeriodNs;
         } else if (local && inferenceDue) {
@@ -465,10 +489,11 @@ bool FlatPpoTracker::stepLocal(double dt, const Eigen::Vector3d& cmd) {
 }
 
 bool FlatPpoTracker::stepHybrid(double dt, const Eigen::Vector3d& cmd, const Eigen::Vector3d& positionWorld,
-                               double yawWorld, std::int64_t gaitElapsedNs, const WaveGenerator& wave) {
+                               const Eigen::Vector3d& velocityWorld, double yawWorld,
+                               std::int64_t gaitElapsedNs, const WaveGenerator& wave) {
     if (!ready() || impl_->mode != Mode::HybridGait) return false;
     try {
-        const Impl::HybridMeasurement measurement{positionWorld, yawWorld, gaitElapsedNs, wave};
+        const Impl::HybridMeasurement measurement{positionWorld, velocityWorld, yawWorld, gaitElapsedNs, wave};
         impl_->update(dt, nullptr, cmd, Eigen::Matrix<double, 3, 4>::Zero(),
                       Eigen::Matrix<int, 4, 1>::Zero(), 0., nullptr, &measurement);
         return true;

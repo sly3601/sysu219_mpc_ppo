@@ -78,6 +78,8 @@ def require_hybrid_policy(model):
     fingerprints = {
         'ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825',  # 975 ms, 2/3 support
         '3320576f27f15e63d83b01b13b0f743e3f9c46b4e626a0e8adff40fc345c6d48',  # 650 ms, 1/2 support
+        '9f517ad3d0bf8e566e2d365d17c1a3a455db3c4c644ad8711d7eedbb0403c055',  # 975 ms, with velocity
+        '4e59ccf367ca6e9de22f18127448059f482187b8da137e26ea765398bc2b61bc',  # 650 ms, with velocity
     }
     try:
         info = json.loads(manifest.read_text(encoding='utf-8'))
