@@ -3,12 +3,14 @@
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 
 import xacro
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, EmitEvent, OpaqueFunction, RegisterEventHandler, TimerAction
+from launch.actions import (DeclareLaunchArgument, EmitEvent, ExecuteProcess, LogInfo, OpaqueFunction,
+                            RegisterEventHandler, TimerAction)
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
@@ -111,10 +113,22 @@ def launch_setup(context):
         arguments=['-d', str(config / 'visualize_urdf.rviz')],
         condition=IfCondition(LaunchConfiguration('rviz')),
     )
-    return [
+    actions = [
         after_success(joints, imu), after_success(imu, guide),
         publisher, manager, joints, TimerAction(period=8.0, actions=[rviz]),
     ]
+    if kind == 'hybrid':
+        # Resolve the source next to a symlinked launch file, plus regular package installs.
+        script = Path(__file__).resolve().parents[1] / 'scripts' / 'capture_hybrid_hold.py'
+        if not script.is_file():
+            script = Path(get_package_prefix('sysu219_guide_controller')) / 'lib/sysu219_guide_controller/capture_hybrid_hold.py'
+        if script.is_file():
+            actions.append(ExecuteProcess(
+                cmd=[sys.executable, str(script)], name='sysu219_hybrid_hold_capture', output='screen',
+            ))
+        else:
+            actions.append(LogInfo(msg='SYSU219 原地踏步采集器未安装，跳过采集。'))
+    return actions
 
 
 def generate_launch_description():

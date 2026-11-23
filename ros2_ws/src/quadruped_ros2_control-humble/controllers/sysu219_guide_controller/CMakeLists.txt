@@ -165,7 +165,7 @@ install(
 install(DIRECTORY model
         DESTINATION share/${PROJECT_NAME}/)
 
-install(PROGRAMS scripts/gazebo_com_visualizer.py
+install(PROGRAMS scripts/gazebo_com_visualizer.py scripts/capture_hybrid_hold.py
         DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY src/COM_identification/
         DESTINATION share/${PROJECT_NAME}/COM_identification
