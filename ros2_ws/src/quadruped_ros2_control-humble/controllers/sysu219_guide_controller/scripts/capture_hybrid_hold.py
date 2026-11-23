@@ -164,9 +164,21 @@ class HoldCapture(Node):
             self.finish()
 
 
+def workspace_log_dir(script):
+    for parent in script.resolve().parents:
+        if parent.name in ("src", "install"):
+            workspace = parent.parent
+            log_dir = workspace / "log" / "sysu219_hold"
+            if not log_dir.resolve().is_relative_to(workspace):
+                raise RuntimeError(f"拒绝写入工作区外的采集目录 {log_dir}")
+            return log_dir
+    raise RuntimeError(f"无法识别采集脚本所属的 ROS 2 工作区 {script}")
+
+
 def main():
+    log_dir = workspace_log_dir(Path(__file__))
     rclpy.init()
-    node = HoldCapture(Path.home() / ".ros" / "sysu219" / "hold")
+    node = HoldCapture(log_dir)
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
