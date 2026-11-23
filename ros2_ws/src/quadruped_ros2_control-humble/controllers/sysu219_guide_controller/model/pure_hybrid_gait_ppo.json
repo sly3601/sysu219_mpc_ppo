@@ -1,6 +1,6 @@
 {
-  "checkpoint": "model_750.pt",
-  "checkpoint_sha256": "ce33a6030748980af7d657d5e2e89f9dc480177333b700806fa2489bb8c12456",
+  "checkpoint": "model_725.pt",
+  "checkpoint_sha256": "f239a2e35c65a99fec74029254b8dba3aa00b7a3e2430dfcdbf3df42b4cba2b3",
   "contract": {
     "id": "sysu219.pure_hybrid_gait74.v1",
     "observation_width": 74,
@@ -175,7 +175,7 @@
     }
   },
   "contract_sha256": "3320576f27f15e63d83b01b13b0f743e3f9c46b4e626a0e8adff40fc345c6d48",
-  "onnx_sha256": "fac1ad70b3850e7b225448f8bebbf4c0581e0ab892a9481fd6c0e6c4556a9ca0",
-  "onnx_reference_vs_torch_max_abs": 9.5367431640625e-07,
-  "run": "2026-11-24_00-54-13"
+  "onnx_sha256": "63058523ca3935d9e768782ac65a5063fce9d018530f2247583a3b64dd6692b9",
+  "onnx_reference_vs_torch_max_abs": 1.5497207641601562e-06,
+  "run": "2026-11-24_02-50-37"
 }
