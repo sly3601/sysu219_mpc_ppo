@@ -1,6 +1,6 @@
 {
-  "checkpoint": "model_3700.pt",
-  "checkpoint_sha256": "5c5a87c1648ca253ad8691d168d0b4676e06477c222959a5bca39eb980aa681a",
+  "checkpoint": "model_750.pt",
+  "checkpoint_sha256": "5b5db66f4034be1412bea800a45af0e18703aaf7c778d4b9ecb2481f1a1d0b73",
   "contract": {
     "id": "sysu219.pure_hybrid_gait74.v1",
     "observation_width": 74,
@@ -108,9 +108,9 @@
       "sin(2*pi*cycle)",
       "cos(2*pi*cycle)"
     ],
-    "period_s": 0.975,
+    "period_s": 0.65,
     "entry_cycle": 0.5,
-    "stance_ratio": 0.6666666666666666,
+    "stance_ratio": 0.5,
     "torque_response_time_s": 0.004,
     "actuation": "PD with zero velocity target and zero feedforward",
     "entry_duration_s": 0.5,
@@ -174,8 +174,8 @@
       "frame": "entry odometry heading axes in XY and world Z"
     }
   },
-  "contract_sha256": "ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825",
-  "onnx_sha256": "2dcbbabb677fe1adc4da7d220e06304f66df022ba1dfdc602009aa13ae8b6bb3",
-  "onnx_reference_vs_torch_max_abs": 1.9073486328125e-06,
-  "run": "2026-11-23_18-07-17"
+  "contract_sha256": "3320576f27f15e63d83b01b13b0f743e3f9c46b4e626a0e8adff40fc345c6d48",
+  "onnx_sha256": "2a8ee2a01d67291284b7093c55ce08e19508112ee6a2271ab4ef8424fd7a7160",
+  "onnx_reference_vs_torch_max_abs": 1.430511474609375e-06,
+  "run": "2026-11-23_23-22-04"
 }
