@@ -75,11 +75,14 @@ def require_hybrid_policy(model):
     manifest = model.with_suffix('.json')
     if not manifest.is_file():
         raise RuntimeError(f'结合版 PPO 缺少导出清单：{manifest}')
-    fingerprint = 'ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825'
+    fingerprints = {
+        'ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825',  # 975 ms, 2/3 support
+        '3320576f27f15e63d83b01b13b0f743e3f9c46b4e626a0e8adff40fc345c6d48',  # 650 ms, 1/2 support
+    }
     try:
         info = json.loads(manifest.read_text(encoding='utf-8'))
         contract = json.dumps(info['contract'], separators=(',', ':'), sort_keys=True).encode()
-        valid = (info['contract_sha256'] == hashlib.sha256(contract).hexdigest() == fingerprint
+        valid = (info['contract_sha256'] == hashlib.sha256(contract).hexdigest() in fingerprints
                  and hashlib.sha256(model.read_bytes()).hexdigest() == info['onnx_sha256'])
     except (KeyError, TypeError, ValueError) as error:
         raise RuntimeError(f'无法读取结合版 PPO 导出清单：{manifest}') from error

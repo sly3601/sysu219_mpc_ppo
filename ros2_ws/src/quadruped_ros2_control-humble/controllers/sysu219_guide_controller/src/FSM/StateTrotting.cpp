@@ -57,11 +57,11 @@ bool StateTrotting::jointFeedbackValid() const {
     return true;
 }
 
-void StateTrotting::updateHybridGaitClock(const rclcpp::Time& time, const rclcpp::Duration& period) {
-    // Called before InEKF takes its joint/IMU snapshot, including the first PPO tick.
-    if (first_) hybrid_gait_start_ns_ = time.nanoseconds();
-    hybrid_gait_elapsed_ns_ = std::max<std::int64_t>(0, time.nanoseconds() - hybrid_gait_start_ns_);
-    components_.wave_generator_->updateSynchronizedTrot(hybrid_gait_elapsed_ns_, period.seconds());
+void StateTrotting::updateSynchronizedGaitClock(const rclcpp::Time& time, const rclcpp::Duration& period) {
+    // State estimation and both gait paths sample the same first trotting tick.
+    if (first_) gait_start_ns_ = time.nanoseconds();
+    gait_elapsed_ns_ = std::max<std::int64_t>(0, time.nanoseconds() - gait_start_ns_);
+    components_.wave_generator_->updateSynchronizedTrot(gait_elapsed_ns_, period.seconds());
 }
 
 void StateTrotting::enter() {
@@ -188,7 +188,7 @@ void StateTrotting::run(const rclcpp::Time& time, const rclcpp::Duration& period
         auto& wave = *components_.wave_generator_;
         if (hybrid_gait_) {
             if (!tracker_.stepHybrid(dt, requestedVelocityBody(), estimator.getPosition(), estimator.getYaw(),
-                                     hybrid_gait_elapsed_ns_, wave)) {
+                                     gait_elapsed_ns_, wave)) {
                 fail("hybrid gait actor rejected synchronized phase, odometry or action");
                 return;
             }
@@ -196,8 +196,8 @@ void StateTrotting::run(const rclcpp::Time& time, const rclcpp::Duration& period
             first_ = false;
             return;
         }
-        if (first_) wave.startTrotFromStand();
         if (pure_gait_) {
+            if (first_) wave.startTrotFromStand();
             const Vec3 velocity_world = estimator.getVelocity();
             const Vec3 measured = estimator.getRotation().transpose() * velocity_world;
             const Vec3 command = requestedVelocityBody();

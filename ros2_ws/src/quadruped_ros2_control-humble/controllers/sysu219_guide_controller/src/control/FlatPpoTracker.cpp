@@ -33,6 +33,7 @@ constexpr char kGaitContract[] = "3ab3ec864488a0d2fdab999b7ccaba431696e8c27b87a7
 constexpr char kSmoothGaitContract[] = "98238c0bf8f22c9f2f9551f4a1c56e0f3881c6c56eb66bc504bbdb0fe08951d3";
 constexpr char kLocalGaitContract[] = "f099e8b4e74eaf6f0b0c2df1aeae13329ef02cab8a75904f5a619583f36bb38c";
 constexpr char kHybridGaitContract[] = "ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825";
+constexpr char kDiagonalHybridGaitContract[] = "3320576f27f15e63d83b01b13b0f743e3f9c46b4e626a0e8adff40fc345c6d48";
 constexpr char kFlatCheckpoint[] = "5d16c702b3bba579830968f16c85722dbb06d75e7f1b6efd922fef3010363228";
 constexpr char kFlatContract[] = "e0f63c48ba5536a61af412bffd122f650b3a18fed27b0f3210f9465d61c8d4ba";
 constexpr char kTrackingContract[] = "930d512bfd01635766017ffa1368a462b5c42879b034827256b82d815737dd65";
@@ -130,6 +131,7 @@ struct FlatPpoTracker::Impl {
     std::unique_ptr<Ort::Session> session;
     Ort::Value input{nullptr}, output{nullptr};
     bool started = false, fault = false, inferred = false;
+    bool equal_hybrid_phases = false;
     double elapsed = 0., sinceInference = 0., blend = 0.;
     double sinceHostTick = 0.;
     std::int64_t nextHybridPolicyNs = 0, previousHybridPolicyNs = 0;
@@ -180,8 +182,10 @@ struct FlatPpoTracker::Impl {
             throw std::runtime_error("Wrong actor tensor names");
         const auto meta = session->GetModelMetadata();
         const auto sha = metadata(meta, "sysu219.checkpoint_sha256");
+        const auto fingerprint = metadata(meta, "sysu219.contract_sha256");
+        equal_hybrid_phases = mode == Mode::HybridGait && fingerprint == kDiagonalHybridGaitContract;
         if (metadata(meta, "sysu219.contract_id") != policy.id ||
-            metadata(meta, "sysu219.contract_sha256") != policy.fingerprint ||
+            (fingerprint != policy.fingerprint && !equal_hybrid_phases) ||
             sha.size() != 64 || sha.find_first_not_of("0123456789abcdef") != std::string::npos ||
             (mode == Mode::FlatMpc && sha != kFlatCheckpoint))
             throw std::runtime_error("Wrong SYSU219 deployment contract or checkpoint");
@@ -221,6 +225,15 @@ struct FlatPpoTracker::Impl {
                 (!started && hybrid->elapsed_ns != 0) ||
                 (started && hybrid->elapsed_ns < previousHybridHostNs))) {
             throw std::runtime_error("Invalid hybrid odometry or shared gait time");
+        }
+        if (hybrid && !started) {
+            const double period = equal_hybrid_phases ? WaveGenerator::kDiagonalTrotPeriod
+                                                      : WaveGenerator::kLegacyTrotPeriod;
+            const double stance_ratio = equal_hybrid_phases ? WaveGenerator::kDiagonalTrotStanceRatio
+                                                            : WaveGenerator::kLegacyTrotStanceRatio;
+            if (std::abs(hybrid->wave.getGaitPeriod() - period) > 1.e-12 ||
+                std::abs(hybrid->wave.get_t_stance() - period * stance_ratio) > 1.e-12)
+                throw std::runtime_error("Hybrid PPO clock disagrees with the deployed policy contract");
         }
         double hostInterval = kControllerPeriod;
         if (policy.filtered_targets) {
@@ -308,7 +321,8 @@ struct FlatPpoTracker::Impl {
             const auto next = hybrid->wave.sampleSynchronizedTrot(hybrid->elapsed_ns + kPolicyPeriodNs);
             const double interval = started
                 ? (hybrid->elapsed_ns - previousHybridPolicyNs) * kSecondsPerNanosecond : kPeriod;
-            const auto reference = localReference.stepSynchronized(bounded, current.cycle, next.contact, next.phase, interval);
+            const auto reference = localReference.stepSynchronized(bounded, current.cycle, next.contact, next.phase,
+                interval, hybrid->wave.get_t_stance(), hybrid->wave.get_t_swing());
             std::copy(reference.begin(), reference.end(), obs.begin() + kProprioceptionWidth);
             if (!started) {
                 hybridPositionOrigin = hybrid->position;
@@ -395,6 +409,7 @@ Eigen::Vector3d FlatPpoTracker::boundCommand(const Eigen::Vector3d& command) {
 FlatPpoTracker::~FlatPpoTracker() = default;
 bool FlatPpoTracker::ready() const { return impl_ && !impl_->fault; }
 bool FlatPpoTracker::didInfer() const { return ready() && impl_->inferred; }
+bool FlatPpoTracker::usesEqualHybridPhases() const { return impl_ && impl_->equal_hybrid_phases; }
 
 void FlatPpoTracker::reset() {
     if (!impl_) return;

@@ -19,6 +19,7 @@ public:
     static Eigen::Vector3d boundCommand(const Eigen::Vector3d& command);
     bool ready() const;
     bool didInfer() const;  // Last successful step computed a fresh actor output.
+    bool usesEqualHybridPhases() const;
     void reset();
     // A false return leaves all motor interfaces untouched. The enclosing FSM
     // must take over on this tick. A reset starts a fresh standing transition.

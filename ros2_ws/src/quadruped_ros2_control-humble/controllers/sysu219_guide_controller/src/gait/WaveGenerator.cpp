@@ -7,6 +7,10 @@
 #include <iostream>
 #include <cmath>
 
+namespace {
+constexpr double kNanosecondsPerSecond = 1.0e9;
+}
+
 WaveGenerator::WaveGenerator(const double period, const double st_ratio, const Vec4 &bias) {
 
     phase_past_ << 0.5, 0.5, 0.5, 0.5;
@@ -35,7 +39,11 @@ WaveGenerator::WaveGenerator(const double period, const double st_ratio, const V
 }
 
 void WaveGenerator::startTrotFromStand() {
-    // 半周期处两对腿均处于支撑期，下一对进入摆动的是右前、左后。
+    if (st_ratio_ == kDiagonalTrotStanceRatio) {
+        updateSynchronizedTrot(0, control_dt_);
+        return;
+    }
+    // The legacy longer stance has both pairs supporting at half cycle.
     control_time_ = 0.5 * period_;
     status_past_ = WaveStatus::STANCE_ALL;
     switch_status_.setZero();
@@ -44,11 +52,10 @@ void WaveGenerator::startTrotFromStand() {
 }
 
 WaveGenerator::TrotSample WaveGenerator::sampleSynchronizedTrot(std::int64_t elapsed_ns) const {
-    constexpr double nanoseconds_per_second = 1.0e9;
-    const auto period_ns = std::llround(period_ * nanoseconds_per_second);
-    const auto stance_ns = std::llround(period_ * st_ratio_ * nanoseconds_per_second);
+    const auto period_ns = std::llround(period_ * kNanosecondsPerSecond);
+    const auto stance_ns = std::llround(period_ * st_ratio_ * kNanosecondsPerSecond);
     const auto swing_ns = period_ns - stance_ns;
-    const auto cycle_ns = (elapsed_ns % period_ns + period_ns / 2) % period_ns;
+    const auto cycle_ns = (elapsed_ns % period_ns + period_ns / 2 + period_ns) % period_ns;
     TrotSample sample{};
     sample.cycle = static_cast<double>(cycle_ns) / period_ns;
     for (int leg = 0; leg < 4; ++leg) {
@@ -158,6 +165,16 @@ std::vector<std::array<int, 4>> WaveGenerator::getMpcContactTable(
 void WaveGenerator::calcWave(Vec4 &phase, VecInt4 &contact, const WaveStatus status) {
     switch (status) {
         case WaveStatus::WAVE_ALL: {
+            if (st_ratio_ == kDiagonalTrotStanceRatio) {
+                // Use the same integer phase boundaries in the model and PPO.
+                const auto elapsed_ns = std::llround((control_time_ - 0.5 * period_) * kNanosecondsPerSecond);
+                const auto sample = sampleSynchronizedTrot(elapsed_ns);
+                for (int leg = 0; leg < 4; ++leg) {
+                    contact(leg) = sample.contact[leg];
+                    phase(leg) = sample.phase[leg];
+                }
+                break;
+            }
             for (int i(0); i < 4; ++i) {
                 normal_t_(i) =
                         fmod(control_time_ + period_ - period_ * bias_(i), period_) / period_;

@@ -25,6 +25,17 @@ namespace sysu219_guide_controller
 {
     using config_type = controller_interface::interface_configuration_type;
 
+    namespace
+    {
+        std::shared_ptr<WaveGenerator> makeTrotWave(bool equal_phases)
+        {
+            const double period = equal_phases ? WaveGenerator::kDiagonalTrotPeriod : WaveGenerator::kLegacyTrotPeriod;
+            const double stance_ratio = equal_phases ? WaveGenerator::kDiagonalTrotStanceRatio
+                                                      : WaveGenerator::kLegacyTrotStanceRatio;
+            return std::make_shared<WaveGenerator>(period, stance_ratio, Vec4(0, 0.5, 0.5, 0));
+        }
+    }
+
 
     controller_interface::InterfaceConfiguration Sysu219GuideController::command_interface_configuration() const
     {
@@ -76,8 +87,8 @@ namespace sysu219_guide_controller
     bool Sysu219GuideController::updateEstimatedState(const rclcpp::Time& time, const rclcpp::Duration& period)
     {
         ctrl_component_.robot_model_->update();
-        if (hybrid_gait_ppo_ && current_state_ == state_list_.trotting)
-            state_list_.trotting->updateHybridGaitClock(time, period);
+        if ((hybrid_gait_ppo_ || !pure_gait_ppo_) && current_state_ == state_list_.trotting)
+            state_list_.trotting->updateSynchronizedGaitClock(time, period);
         else
             ctrl_component_.wave_generator_->update(period.seconds());
         ctrl_component_.estimator_->update();
@@ -645,8 +656,8 @@ namespace sysu219_guide_controller
 #endif
             });
 
-        // 摆动保持 0.325 s，支撑加倍为 0.650 s；每次对角交接四足支撑 0.1625 s。
-        ctrl_component_.wave_generator_ = std::make_shared<WaveGenerator>(0.975, 2.0 / 3.0, Vec4(0, 0.5, 0.5, 0));
+        // Model control uses the equal diagonal phases. Pure PPO models keep their trained clock.
+        ctrl_component_.wave_generator_ = makeTrotWave(!pure_gait_ppo_);
 
         return CallbackReturn::SUCCESS;
     }
@@ -787,6 +798,8 @@ namespace sysu219_guide_controller
                              hybrid_gait_ppo_ ? "74-input hybrid" : local_gait_ppo_ ? "71-input local" : "74-input smooth");
                 return CallbackReturn::ERROR;
             }
+            if (hybrid_gait_ppo_)
+                ctrl_component_.wave_generator_ = makeTrotWave(state_list_.trotting->usesEqualHybridPhases());
         }
         if (legacyStatesEnabled()) {
             state_list_.swingTest = std::make_shared<StateSwingTest>(ctrl_interfaces_, ctrl_component_);

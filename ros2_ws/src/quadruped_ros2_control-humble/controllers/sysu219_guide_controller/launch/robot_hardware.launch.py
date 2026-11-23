@@ -51,7 +51,10 @@ def require_pure_policy(model_dir, kind='pure'):
                  and hashlib.sha256(contract_bytes).hexdigest() == info['contract_sha256']
                  and hashlib.sha256(model.read_bytes()).hexdigest() == info['onnx_sha256'])
         if kind == 'hybrid':
-            valid = valid and info['contract_sha256'] == 'ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825'
+            valid = valid and info['contract_sha256'] in {
+                'ef3bfbb7be7b1350eca8b7ef3211e9070947c6635f78384e936877da3fce1825',  # 975 ms, 2/3 support
+                '3320576f27f15e63d83b01b13b0f743e3f9c46b4e626a0e8adff40fc345c6d48',  # 650 ms, 1/2 support
+            }
     except (KeyError, TypeError, ValueError) as error:
         raise RuntimeError(f'无法读取纯 PPO 导出清单：{manifest}') from error
     if not valid:

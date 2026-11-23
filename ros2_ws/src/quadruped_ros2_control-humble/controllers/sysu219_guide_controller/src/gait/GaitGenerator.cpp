@@ -95,6 +95,10 @@ void GaitGenerator::generate(Vec34 &feet_pos, Vec34 &feet_vel,
             }
         }
         contact_last_ = motion_contact_;
+        // Equal-phase trot can lift the first diagonal on its first sample.
+        // The preceding FIXEDSTAND still supplies all four liftoff anchors.
+        if (wave_generator_->get_t_stance() == wave_generator_->get_t_swing())
+            contact_last_.setOnes();
         swing_start_offset_.setZero();
         swing_pos_ = start_p_;
         swing_vel_.setZero();

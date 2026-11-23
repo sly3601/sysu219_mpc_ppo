@@ -25,19 +25,21 @@ public:
             next_phase[leg] = next_contact[leg] ? static_cast<double>(leg_tick) / kStanceTicks
                                                : static_cast<double>(leg_tick - kStanceTicks) / kSwingTicks;
         }
-        return plan(command_body, angle, next_contact, next_phase, kActorPeriod);
+        return plan(command_body, angle, next_contact, next_phase, kActorPeriod, kStance, kSwing);
     }
 
     std::array<float, 26> stepSynchronized(const Eigen::Vector3d& command_body, double current_cycle,
                                            const std::array<int, 4>& next_contact,
-                                           const std::array<double, 4>& next_phase, double sample_interval) {
-        return plan(command_body, kTau * current_cycle, next_contact, next_phase, sample_interval);
+                                           const std::array<double, 4>& next_phase, double sample_interval,
+                                           double stance_time, double swing_time) {
+        return plan(command_body, kTau * current_cycle, next_contact, next_phase, sample_interval,
+                    stance_time, swing_time);
     }
 
 private:
     std::array<float, 26> plan(const Eigen::Vector3d& command_body, double angle,
                                const std::array<int, 4>& next_contact, const std::array<double, 4>& next_phase,
-                               double sample_interval) {
+                               double sample_interval, double stance_time, double swing_time) {
         const double alpha = -std::expm1(-sample_interval / kCommandTimeConstant);
         filtered_command_ += alpha * (command_body - filtered_command_);
 
@@ -52,15 +54,16 @@ private:
             double offset, speed;
             double z = kNominalZ, vz = 0.0;
             if (next_contact[leg]) {
-                offset = kStance * (0.5 - u);
+                offset = stance_time * (0.5 - u);
                 speed = -1.0;
             } else {
                 const double u2 = u * u;
                 // Cubic Hermite swing joins the stance velocity at both endpoints.
-                offset = kStance * (u2 * (3.0 - 2.0 * u) - 0.5) - kSwing * (u - 3.0 * u2 + 2.0 * u2 * u);
-                speed = kStance / kSwing * 6.0 * u * (1.0 - u) - (1.0 - 6.0 * u + 6.0 * u2);
+                offset = stance_time * (u2 * (3.0 - 2.0 * u) - 0.5)
+                       - swing_time * (u - 3.0 * u2 + 2.0 * u2 * u);
+                speed = stance_time / swing_time * 6.0 * u * (1.0 - u) - (1.0 - 6.0 * u + 6.0 * u2);
                 z += 0.5 * kHeight * (1.0 - std::cos(kTau * u));
-                vz = 0.5 * kTau * kHeight / kSwing * std::sin(kTau * u);
+                vz = 0.5 * kTau * kHeight / swing_time * std::sin(kTau * u);
             }
             const std::size_t index = 3 * leg;
             reference[2 + index] = static_cast<float>(foot.x + vx * offset);

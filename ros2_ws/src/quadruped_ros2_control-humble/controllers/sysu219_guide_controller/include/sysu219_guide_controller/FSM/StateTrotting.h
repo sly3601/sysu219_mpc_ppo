@@ -23,13 +23,14 @@ public:
     StateTrotting(CtrlInterfaces& interfaces, CtrlComponent& components, bool pure_gait,
                   bool smooth_gait = false, bool local_gait = false, bool hybrid_gait = false);
     void enter() override;
-    void updateHybridGaitClock(const rclcpp::Time& time, const rclcpp::Duration& period);
+    void updateSynchronizedGaitClock(const rclcpp::Time& time, const rclcpp::Duration& period);
     void run(const rclcpp::Time& time, const rclcpp::Duration& period) override;
     void exit() override;
     FSMStateName checkChange() override;
 
     bool faulted() const { return fault_; }
     bool ready() const { return tracker_.ready(); }
+    bool usesEqualHybridPhases() const { return tracker_.usesEqualHybridPhases(); }
     bool jointFeedbackValid() const;
     double getFilteredYawRateGlobal() const { return (rotation_ * gyro_)(2); }
 
@@ -74,7 +75,7 @@ private:
     double yaw_goal_ = 0.0, yaw_rate_goal_ = 0.0;
     double entry_height_ = 0.0, initial_height_ = 0.0, height_elapsed_ = 0.0;
     double last_plan_s_ = -1.0, last_tick_s_ = -1.0;
-    std::int64_t hybrid_gait_start_ns_ = 0, hybrid_gait_elapsed_ns_ = 0;
+    std::int64_t gait_start_ns_ = 0, gait_elapsed_ns_ = 0;
     RotMat rotation_;
     Vec3 gyro_, raw1_, raw2_, filtered1_, filtered2_;
     VecInt4 contact_, last_plan_contact_;

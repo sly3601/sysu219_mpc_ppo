@@ -20,6 +20,11 @@ inline long long getSystemTime() {
 
 class WaveGenerator {
 public:
+    static constexpr double kLegacyTrotPeriod = 0.975;
+    static constexpr double kLegacyTrotStanceRatio = 2.0 / 3.0;
+    static constexpr double kDiagonalTrotPeriod = 0.650;
+    static constexpr double kDiagonalTrotStanceRatio = 0.5;
+
     struct TrotSample {
         double cycle;
         std::array<int, 4> contact;
