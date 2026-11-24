@@ -18,7 +18,8 @@ constexpr double ramp_seconds = 3.0 - hold_threshold_seconds;
 constexpr auto trotting_timeout = std::chrono::milliseconds(250);
 
 bool isDirection(int key) {
-    return key == Qt::Key_W || key == Qt::Key_S || key == Qt::Key_A || key == Qt::Key_D;
+    return key == Qt::Key_W || key == Qt::Key_S || key == Qt::Key_A || key == Qt::Key_D ||
+           key == Qt::Key_Z || key == Qt::Key_C;
 }
 
 class KeyboardWindow final : public QWidget {
@@ -29,14 +30,15 @@ public:
         auto* layout = new QVBoxLayout(this);
         layout->addWidget(&status_);
         layout->addWidget(new QLabel(QStringLiteral("W/S 前后走   A/D 原地转   长按 3 秒到上限"), this));
+        layout->addWidget(new QLabel(QStringLiteral("Z/C 左右平移（支持横移的策略）"), this));
         layout->addWidget(new QLabel(QStringLiteral("1 被动   2 固定姿态   8 趴下   空格清零"), this));
         layout->addWidget(new QLabel(QStringLiteral("3–7 / 9 模式键（hybrid 站稳后选策略）"), this));
         refreshStatus();
     }
 
     void refreshStatus() {
-        status_.setText(input_.trottingActive() ? QStringLiteral("正在踏步 · WASD 已启用")
-                                               : QStringLiteral("WASD 等待进入踏步"));
+        status_.setText(input_.trottingActive() ? QStringLiteral("正在踏步 · 运动键已启用")
+                                               : QStringLiteral("运动键等待进入踏步"));
     }
 
 private:
@@ -171,6 +173,8 @@ void KeyboardInput::update() {
         case Qt::Key_S: motion.ly = -fraction; break;
         case Qt::Key_A: motion.rx = -fraction; break;
         case Qt::Key_D: motion.rx = fraction; break;
+        case Qt::Key_Z: motion.lx = fraction; break;
+        case Qt::Key_C: motion.lx = -fraction; break;
     }
     motion_publisher_->publish(motion);
 }

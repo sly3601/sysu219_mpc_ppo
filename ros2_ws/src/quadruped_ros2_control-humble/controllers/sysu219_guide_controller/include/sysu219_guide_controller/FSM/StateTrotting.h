@@ -45,7 +45,7 @@ public:
 
 private:
     struct MotionInput {
-        double ly = 0.0, rx = 0.0;
+        double lx = 0.0, ly = 0.0, rx = 0.0;
         std::chrono::steady_clock::time_point received_at{};
     };
     using Reference = std_msgs::msg::Float64MultiArray;

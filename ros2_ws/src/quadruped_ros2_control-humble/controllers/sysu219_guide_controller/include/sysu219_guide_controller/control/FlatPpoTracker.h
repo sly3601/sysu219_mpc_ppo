@@ -15,12 +15,14 @@ class WaveGenerator;
 class FlatPpoTracker {
 public:
     enum class Mode { FlatMpc, FootTrackingMpc, PureGait, SmoothGait, LocalGait, HybridGait };
+    static constexpr double kHybridLateralSpeedLimit = 0.12;
     explicit FlatPpoTracker(CtrlInterfaces& interfaces, Mode mode, const std::string& model_name = {});
     ~FlatPpoTracker();
     static Eigen::Vector3d boundCommand(const Eigen::Vector3d& command);
     bool ready() const;
     bool didInfer() const;  // Last successful step computed a fresh actor output.
     bool usesEqualHybridPhases() const;
+    bool supportsHybridLateralCommand() const;
     void reset();
     // A false return leaves all motor interfaces untouched. The enclosing FSM
     // must take over on this tick. A reset starts a fresh standing transition.

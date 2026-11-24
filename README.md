@@ -86,7 +86,7 @@ ros2 launch sysu219_guide_controller gazebo.launch.py policy:=hybrid
 ros2 run keyboard_input keyboard_input
 ```
 
-每次等姿态切换完成，再按下一次 `2`。从 PASSIVE 开始依次进入全趴、半趴和 FIXEDSTAND。用 `policy:=hybrid` 启动时，在 FIXEDSTAND 站稳后按下表的策略键。踏步中按 `2` 回到固定站姿，等站稳再选下一策略。`W/S` 前后，`A/D` 转向，松开运动键回零速踏步。`1` 进被动阻尼，站稳后按 `8` 先半趴再全趴。
+每次等姿态切换完成，再按下一次 `2`。从 PASSIVE 开始依次进入全趴、半趴和 FIXEDSTAND。用 `policy:=hybrid` 启动时，在 FIXEDSTAND 站稳后按下表的策略键。踏步中按 `2` 回到固定站姿，等站稳再选下一策略。`W/S` 前后，`A/D` 转向，松开运动键回零速踏步。支持横移的 XY 闭环策略可用 `Z` 左移、`C` 右移，长按 3 秒达到 0.12 m/s。横移指令下目标前进速度和航向角速度均为零。`1` 进被动阻尼，站稳后按 `8` 先半趴再全趴。
 
 ## v4 对照策略
 

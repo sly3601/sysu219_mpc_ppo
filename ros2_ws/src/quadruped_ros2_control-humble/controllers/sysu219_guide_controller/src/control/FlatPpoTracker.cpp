@@ -373,8 +373,13 @@ struct FlatPpoTracker::Impl {
                                checked(imu[2]->get_value()), checked(imu[3]->get_value()));
         if (!std::isfinite(rot.norm()) || rot.norm() < 1.e-6) throw std::runtime_error("Invalid IMU orientation");
         const Eigen::Vector3d gravity = rot.normalized().conjugate() * Eigen::Vector3d(0., 0., -1.);
+        const bool lateralCommand = hybrid && hybrid_xy_hold && cmd.y() != 0.0;
         Eigen::Vector3d bounded = FlatPpoTracker::boundCommand(cmd);
-        if (policy.filtered_targets) bounded << std::clamp(cmd.x(), -0.3, 0.3), 0.0, std::clamp(cmd.z(), -0.3, 0.3);
+        if (lateralCommand) {
+            bounded << 0.0, std::clamp(cmd.y(), -kHybridLateralSpeedLimit, kHybridLateralSpeedLimit), 0.0;
+        } else if (policy.filtered_targets) {
+            bounded << std::clamp(cmd.x(), -0.3, 0.3), 0.0, std::clamp(cmd.z(), -0.3, 0.3);
+        }
         const std::size_t feedbackOffset = local ? 0 : 3;
         for (std::size_t i = 0; i < 3; ++i) {
             if (!local) obs[i] = static_cast<float>((*velocity)[i]);
@@ -438,8 +443,9 @@ struct FlatPpoTracker::Impl {
                 // Training first advances hold feedback after the gait-entry sample.
                 if (hybrid_xy_hold && started) {
                     for (const float value : measurement) checked(value);
-                    bounded.head<2>() += planarHold.advance(measurement, (cmd.array() == 0.).all(),
-                                                             hybrid->yaw - hybridEntryYaw);
+                    const auto trim = planarHold.advance(measurement, (cmd.array() == 0.).all(),
+                                                         hybrid->yaw - hybridEntryYaw);
+                    if (!lateralCommand) bounded.head<2>() += trim;
                     bounded.x() = std::clamp(bounded.x(), -0.3, 0.3);
                     obs[feedbackOffset + 6] = static_cast<float>(bounded.x());
                     obs[feedbackOffset + 7] = static_cast<float>(bounded.y());
@@ -556,6 +562,7 @@ FlatPpoTracker::~FlatPpoTracker() = default;
 bool FlatPpoTracker::ready() const { return impl_ && !impl_->fault; }
 bool FlatPpoTracker::didInfer() const { return ready() && impl_->inferred; }
 bool FlatPpoTracker::usesEqualHybridPhases() const { return impl_ && impl_->equal_hybrid_phases; }
+bool FlatPpoTracker::supportsHybridLateralCommand() const { return ready() && impl_->hybrid_xy_hold; }
 
 void FlatPpoTracker::reset() {
     if (!impl_) return;

@@ -1,6 +1,6 @@
 {
-  "checkpoint": "model_375.pt",
-  "checkpoint_sha256": "85331ac1c35497c34f8009218d5cb458fa9921a7b1a2c97d8291b7eb0ab807bb",
+  "checkpoint": "model_1350.pt",
+  "checkpoint_sha256": "a11c9f74be475016058cc8bf05196b352eda9712741c9778ee5dc3b0a6259d97",
   "contract": {
     "id": "sysu219.pure_hybrid_gait75.xy_hold.v1",
     "observation_width": 75,
@@ -226,8 +226,8 @@
     }
   },
   "contract_sha256": "e232761e259c78810a7a200f6783ba9d718c9f5fd6661cb222c9270e57cbe8aa",
-  "onnx_sha256": "8f37a48855eb100b151b1f2e6ea6c8023460467906cb7620e1562318bf1a15cd",
-  "onnx_reference_vs_torch_max_abs": 9.5367431640625e-07,
-  "run": "2026-11-24_20-31-40_key5_xy_hold_30n_soft_yaw",
+  "onnx_sha256": "10a10303d19bf843df9f845b951d6dc8094dc24508ad33edb8d0a8fc7c52e09f",
+  "onnx_reference_vs_torch_max_abs": 1.7881393432617188e-06,
+  "run": "2026-11-25_03-26-39_key5_pure_lateral_scratch_1",
   "keyboard_slot": 6
 }

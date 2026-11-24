@@ -45,7 +45,7 @@ StateTrotting::StateTrotting(CtrlInterfaces& interfaces, CtrlComponent& componen
     motion_subscription_ = interfaces.node->create_subscription<control_input_msgs::msg::Inputs>(
         "/trotting_motion_input", rclcpp::QoS(1),
         [buffer = motion_](const control_input_msgs::msg::Inputs& msg) {
-            buffer->writeFromNonRT({msg.ly, msg.rx, std::chrono::steady_clock::now()});
+            buffer->writeFromNonRT({msg.lx, msg.ly, msg.rx, std::chrono::steady_clock::now()});
         });
     auto status = rclcpp::create_publisher<std_msgs::msg::Empty>(
         interfaces.node, "/trotting_active", rclcpp::QoS(1).best_effort());
@@ -144,6 +144,11 @@ Vec3 StateTrotting::requestedVelocityBody() const {
     const auto motion = *motion_->readFromRT();
     if (motion.received_at >= entry_at_ &&
         std::chrono::steady_clock::now() - motion.received_at <= std::chrono::milliseconds(250)) {
+        if (hybrid_gait_ && active_tracker_ && active_tracker_->supportsHybridLateralCommand() &&
+            std::isfinite(motion.lx) && motion.lx != 0.0) {
+            command.y() = FlatPpoTracker::kHybridLateralSpeedLimit * std::clamp(motion.lx, -1.0, 1.0);
+            return command;
+        }
         if (std::isfinite(motion.ly)) command.x() = 0.3 * std::clamp(motion.ly, -1.0, 1.0);
         if (std::isfinite(motion.rx)) command.z() = -0.3 * std::clamp(motion.rx, -1.0, 1.0);
     }
