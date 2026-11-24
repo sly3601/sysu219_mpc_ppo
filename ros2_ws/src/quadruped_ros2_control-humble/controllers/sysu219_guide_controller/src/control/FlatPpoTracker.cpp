@@ -120,6 +120,10 @@ class PlanarOdometryHold {
 public:
     using Sample = std::array<float, 4>;  // x, y, vx, vy in the fixed entry-heading frame.
 
+    explicit PlanarOdometryHold(bool strongerLateralHold)
+        : positionGain_{0.35f, strongerLateralHold ? 0.50f : 0.35f},
+          trimLimit_{0.05f, strongerLateralHold ? 0.06f : 0.04f} {}
+
     void reset() {
         seedPending_ = true;
         active_ = false;
@@ -154,7 +158,8 @@ public:
             if (active) {
                 const float positionError = deadband(anchor_[axis] - filtered_[axis], 0.015f);
                 const float speedError = deadband(filtered_[axis + 2], 0.008f);
-                desired = std::clamp(0.35f * positionError - 0.6f * speedError, -kLimit[axis], kLimit[axis]);
+                desired = std::clamp(positionGain_[axis] * positionError - 0.6f * speedError,
+                                     -trimLimit_[axis], trimLimit_[axis]);
             }
             entryTrim_[axis] += std::clamp(desired - entryTrim_[axis], -kMaxTrimStep, kMaxTrimStep);
         }
@@ -162,7 +167,7 @@ public:
         const auto s = static_cast<float>(std::sin(relativeYaw));
         const float bodyX = c * entryTrim_[0] + s * entryTrim_[1];
         const float bodyY = -s * entryTrim_[0] + c * entryTrim_[1];
-        return {bodyX, std::clamp(bodyY, -kLimit[1], kLimit[1])};
+        return {bodyX, std::clamp(bodyY, -trimLimit_[1], trimLimit_[1])};
     }
 
 private:
@@ -172,7 +177,8 @@ private:
 
     inline static const float kFilterAlpha = static_cast<float>(-std::expm1(-kPeriod / 0.25));
     static constexpr float kMaxTrimStep = static_cast<float>(0.025 * kPeriod);
-    static constexpr std::array<float, 2> kLimit{0.05f, 0.04f};
+    const std::array<float, 2> positionGain_;
+    const std::array<float, 2> trimLimit_;
 
     Sample previous_{}, older_{}, filtered_{};
     std::array<Sample, 33> window_{};
@@ -225,7 +231,8 @@ struct FlatPpoTracker::Impl {
     double transition, entryTolerance, entrySpeed, maxDt;
 
     Impl(CtrlInterfaces& interfaces, Mode selected, const std::filesystem::path& path)
-        : io(interfaces), mode(selected), policy(policyFor(mode)) {
+        : io(interfaces), mode(selected), policy(policyFor(mode)),
+          planarHold(selected == Mode::HybridGait && path.filename() == "pure_hybrid_gait_key6.onnx") {
         if (!io.node) throw std::runtime_error("Missing ROS controller node");
         transition = checked(io.node->get_parameter("rl_pose_transition_s").as_double());
         entryTolerance = checked(io.node->get_parameter("rl_entry_tolerance_rad").as_double());
