@@ -13,11 +13,17 @@ public:
     explicit StateFixedStand(CtrlInterfaces &ctrl_interfaces,
                              const std::vector<double> &target_pos,
                              double kp,
-                             double kd);
+                             double kd,
+                             bool hybrid_policy_slots = false);
 
     void enter() override;
     std::array<double, 12> targetPosition() const;
     FSMStateName checkChange() override;
+    int requestedPolicyKey() const { return requested_policy_key_; }
+
+private:
+    const bool hybrid_policy_slots_;
+    int requested_policy_key_ = 0;
 };
 
 

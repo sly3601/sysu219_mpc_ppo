@@ -147,7 +147,7 @@ struct FlatPpoTracker::Impl {
     Eigen::Vector2d hybridHeading = Eigen::Vector2d::UnitX();
     double transition, entryTolerance, entrySpeed, maxDt;
 
-    Impl(CtrlInterfaces& interfaces, Mode selected)
+    Impl(CtrlInterfaces& interfaces, Mode selected, const std::filesystem::path& path)
         : io(interfaces), mode(selected), policy(policyFor(mode)) {
         if (!io.node) throw std::runtime_error("Missing ROS controller node");
         transition = checked(io.node->get_parameter("rl_pose_transition_s").as_double());
@@ -172,8 +172,6 @@ struct FlatPpoTracker::Impl {
                                                 "angular_velocity.x", "angular_velocity.y", "angular_velocity.z"};
         const auto name = io.node->get_parameter("imu_name").as_string();
         for (std::size_t i = 0; i < fields.size(); ++i) imu[i] = port(io.imu_state_interface_, name, fields[i]);
-        const auto path = std::filesystem::path(ament_index_cpp::get_package_share_directory("sysu219_guide_controller"))
-                          / "model" / policy.model;
         Ort::SessionOptions options;
         options.SetIntraOpNumThreads(1);
         options.SetInterOpNumThreads(1);
@@ -414,11 +412,20 @@ struct FlatPpoTracker::Impl {
     }
 };
 
-FlatPpoTracker::FlatPpoTracker(CtrlInterfaces& interfaces, Mode mode) {
+FlatPpoTracker::FlatPpoTracker(CtrlInterfaces& interfaces, Mode mode, const std::string& model_name) {
     try {
-        impl_ = std::make_unique<Impl>(interfaces, mode);
+        const auto path = std::filesystem::path(ament_index_cpp::get_package_share_directory("sysu219_guide_controller"))
+            / "model" / (model_name.empty() ? std::string(policyFor(mode).model) : model_name);
+        if (!model_name.empty() && !std::filesystem::is_regular_file(path)) {
+            if (interfaces.node)
+                RCLCPP_INFO(interfaces.node->get_logger(), "Optional PPO model unavailable: %s", path.c_str());
+            return;
+        }
+        impl_ = std::make_unique<Impl>(interfaces, mode, path);
     } catch (const std::exception& e) {
-        if (interfaces.node) RCLCPP_ERROR(interfaces.node->get_logger(), "PPO actuator unavailable: %s", e.what());
+        if (interfaces.node)
+            RCLCPP_ERROR(interfaces.node->get_logger(), "PPO model %s unavailable: %s",
+                         model_name.empty() ? "for the startup profile" : model_name.c_str(), e.what());
     }
 }
 

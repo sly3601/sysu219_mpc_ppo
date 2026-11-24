@@ -29,7 +29,8 @@ public:
         auto* layout = new QVBoxLayout(this);
         layout->addWidget(&status_);
         layout->addWidget(new QLabel(QStringLiteral("W/S 前后走   A/D 原地转   长按 3 秒到上限"), this));
-        layout->addWidget(new QLabel(QStringLiteral("1 被动   2 固定姿态   4 踏步   空格清零"), this));
+        layout->addWidget(new QLabel(QStringLiteral("1 被动   2 固定姿态   8 趴下   空格清零"), this));
+        layout->addWidget(new QLabel(QStringLiteral("3–7 / 9 模式键（hybrid 站稳后选策略）"), this));
         refreshStatus();
     }
 
@@ -91,10 +92,12 @@ void KeyboardInput::press(int key, bool repeat) {
 
     if (key >= Qt::Key_0 && key <= Qt::Key_9) {
         if (repeat) return;
+        const int command = key == Qt::Key_0 ? 10 : key - Qt::Key_0;
+        if (trottingActive() && ((command >= 3 && command <= 7) || command == 9)) return;
         stopMotion();
         last_trotting_frame_ = {};
         inputs_ = control_input_msgs::msg::Inputs{};
-        inputs_.command = key == Qt::Key_0 ? 10 : key - Qt::Key_0;
+        inputs_.command = command;
         publisher_->publish(inputs_);
         clear_command_at_ = Clock::now() + std::chrono::milliseconds(20);
         return;

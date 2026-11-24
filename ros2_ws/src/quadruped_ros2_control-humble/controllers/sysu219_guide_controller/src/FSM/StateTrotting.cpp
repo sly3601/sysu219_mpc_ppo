@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <string>
+#include <utility>
 #include <rclcpp/create_publisher.hpp>
 
 #include "sysu219_guide_controller/common/mathTools.h"
@@ -25,7 +27,21 @@ StateTrotting::StateTrotting(CtrlInterfaces& interfaces, CtrlComponent& componen
           pure_gait_ ? FlatPpoTracker::Mode::PureGait :
           (interfaces.node->get_parameter("mpc_ppo_foot_tracking").as_bool() ?
                FlatPpoTracker::Mode::FootTrackingMpc : FlatPpoTracker::Mode::FlatMpc)),
+      active_tracker_(hybrid_gait_ ? nullptr : &tracker_),
       stand_(interfaces.node->get_parameter("stand_pos").as_double_array()) {
+    if (hybrid_gait_ && tracker_.ready()) {
+        for (std::size_t i = 0; i < hybrid_policy_keys_.size(); ++i) {
+            const auto name = "pure_hybrid_gait_key" + std::to_string(hybrid_policy_keys_[i]) + ".onnx";
+            auto slot = std::make_unique<FlatPpoTracker>(interfaces, FlatPpoTracker::Mode::HybridGait, name);
+            if (!slot->ready()) continue;
+            if (slot->usesEqualHybridPhases() != tracker_.usesEqualHybridPhases()) {
+                RCLCPP_WARN(interfaces.node->get_logger(), "Ignoring %s: incompatible shared gait clock",
+                            name.c_str());
+                continue;
+            }
+            hybrid_trackers_[i] = std::move(slot);
+        }
+    }
     motion_subscription_ = interfaces.node->create_subscription<control_input_msgs::msg::Inputs>(
         "/trotting_motion_input", rclcpp::QoS(1),
         [buffer = motion_](const control_input_msgs::msg::Inputs& msg) {
@@ -45,6 +61,21 @@ StateTrotting::StateTrotting(CtrlInterfaces& interfaces, CtrlComponent& componen
         realtime_pub_ = std::make_unique<realtime_tools::RealtimePublisher<Reference>>(reference_pub_);
         realtime_pub_->msg_.data.resize(20);
     }
+}
+
+bool StateTrotting::isHybridPolicyKey(int key) {
+    return std::find(hybrid_policy_keys_.begin(), hybrid_policy_keys_.end(), key) != hybrid_policy_keys_.end();
+}
+
+bool StateTrotting::selectHybridPolicy(int key) {
+    if (!hybrid_gait_) return false;
+    const auto found = std::find(hybrid_policy_keys_.begin(), hybrid_policy_keys_.end(), key);
+    if (found == hybrid_policy_keys_.end()) return false;
+    auto* slot = hybrid_trackers_[found - hybrid_policy_keys_.begin()].get();
+    if (!slot || !slot->ready()) return false;
+    active_tracker_ = slot;
+    selected_key_ = key;
+    return true;
 }
 
 bool StateTrotting::jointFeedbackValid() const {
@@ -71,12 +102,14 @@ void StateTrotting::enter() {
     entry_at_ = std::chrono::steady_clock::now();
     last_plan_contact_.setZero();
     contact_.setOnes();
-    tracker_.reset();
+    if (active_tracker_) active_tracker_->reset();
     ctrl_interfaces_.control_inputs_.command = 0;
     if (!ready() || !jointFeedbackValid()) {
         fail("actor or joint feedback unavailable at entry");
         return;
     }
+    if (hybrid_gait_)
+        RCLCPP_INFO(ctrl_interfaces_.node->get_logger(), "[PPO_TROTTING] entered with policy key %d", selected_key_);
     if (local_gait_) return;
     components_.wave_generator_->status_ = WaveStatus::STANCE_ALL;
     if (pure_gait_) return;
@@ -176,23 +209,23 @@ void StateTrotting::run(const rclcpp::Time& time, const rclcpp::Duration& period
         }
         last_tick_s_ = now;
         if (local_gait_) {
-            if (!tracker_.stepLocal(dt, requestedVelocityBody())) {
+            if (!active_tracker_->stepLocal(dt, requestedVelocityBody())) {
                 fail("local gait actor rejected feedback or action");
                 return;
             }
-            if (tracker_.didInfer()) publishTrottingActive();
+            if (active_tracker_->didInfer()) publishTrottingActive();
             first_ = false;
             return;
         }
         auto& estimator = *components_.estimator_;
         auto& wave = *components_.wave_generator_;
         if (hybrid_gait_) {
-            if (!tracker_.stepHybrid(dt, requestedVelocityBody(), estimator.getPosition(), estimator.getVelocity(),
-                                     estimator.getYaw(), gait_elapsed_ns_, wave)) {
+            if (!active_tracker_->stepHybrid(dt, requestedVelocityBody(), estimator.getPosition(), estimator.getVelocity(),
+                                             estimator.getYaw(), gait_elapsed_ns_, wave)) {
                 fail("hybrid gait actor rejected synchronized phase, odometry or action");
                 return;
             }
-            if (tracker_.didInfer()) publishTrottingActive();
+            if (active_tracker_->didInfer()) publishTrottingActive();
             first_ = false;
             return;
         }
@@ -207,16 +240,16 @@ void StateTrotting::run(const rclcpp::Time& time, const rclcpp::Duration& period
                     estimator.getPosition(), velocity_world, estimator.getYaw(), estimator.getDYaw(),
                     estimator.getFeetPos()
                 };
-                accepted = tracker_.stepSmooth(dt, measured, command, reference);
+                accepted = active_tracker_->stepSmooth(dt, measured, command, reference);
             } else {
                 const double cycle = wave.getPhaseControlTime() / wave.getGaitPeriod();
-                accepted = tracker_.step(dt, measured, command, Vec34::Zero(), VecInt4::Zero(), cycle);
+                accepted = active_tracker_->step(dt, measured, command, Vec34::Zero(), VecInt4::Zero(), cycle);
             }
             if (!accepted) {
                 fail("pure gait actor rejected feedback or action");
                 return;
             }
-            if (tracker_.didInfer()) publishTrottingActive();
+            if (active_tracker_->didInfer()) publishTrottingActive();
             first_ = false;
             return;
         }
@@ -256,11 +289,11 @@ void StateTrotting::run(const rclcpp::Time& time, const rclcpp::Duration& period
 
         const Vec34 feet_body = rotation_.transpose() * (feet_goal_.colwise() - position_);
         const Vec3 velocity_body = rotation_.transpose() * velocity_;
-        if (!tracker_.step(dt, velocity_body, command_, feet_body, contact_)) {
+        if (!active_tracker_->step(dt, velocity_body, command_, feet_body, contact_)) {
             fail("PPO inference or command validation failed");
             return;
         }
-        if (tracker_.didInfer()) {
+        if (active_tracker_->didInfer()) {
             publishTrottingActive();
             publishReference(now, feet_body);
         }
@@ -303,7 +336,11 @@ void StateTrotting::fail(const char* reason) {
 }
 
 void StateTrotting::exit() {
-    tracker_.reset();
+    if (active_tracker_) active_tracker_->reset();
+    if (hybrid_gait_) {
+        active_tracker_ = nullptr;
+        selected_key_ = 0;
+    }
     if (!local_gait_) components_.wave_generator_->status_ = WaveStatus::STANCE_ALL;
 }
 

@@ -1,6 +1,6 @@
 # SYSU219 纯 PPO 真机与 Gazebo
 
-本工程使用 ROS 2 Humble。当前 v4 策略使用 `policy:=hybrid`，在 v3 的观测末尾加入原 InEKF 提供的三轴相对位置。PPO 和 InEKF 共用 250 Hz 主控步态时钟，PPO 按 50 Hz 推理。回看旧版本时，v3 使用 `policy:=local`，第一次真机测试的 v1 使用 `policy:=smooth`。
+本工程使用 ROS 2 Humble。v4 使用 `policy:=hybrid`，读取原 InEKF 的三轴相对位置，77 维版本还读取三轴线速度。PPO 和 InEKF 共用 250 Hz 主控步态时钟，PPO 按 50 Hz 推理。回看旧版本时，v3 使用 `policy:=local`，第一次真机测试的 v1 使用 `policy:=smooth`。
 
 ## 编译
 
@@ -39,14 +39,14 @@ colcon build \
   --cmake-args -DCMAKE_BUILD_TYPE=Release
 ```
 
-### 已有 v3 工作区升级到 v4
+### 已有工作区更新控制器和模型
 
-将本工程的 v4 源码和模型文件同步到真机电脑。已有其他依赖包的编译产物时，在上面进入的 `ros2_ws` 终端重编控制器和描述包。
+将本工程的新源码和模型文件同步到真机电脑。已有其他依赖包的编译产物时，在上面进入的 `ros2_ws` 终端增量构建。
 
 ```bash
 MAKEFLAGS="-j1 -l1" CMAKE_BUILD_PARALLEL_LEVEL=1 \
 colcon build --executor sequential \
-  --packages-select sysu219_guide_controller sysu219_description \
+  --packages-select sysu219_guide_controller sysu219_description keyboard_input \
   --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 ```
 
@@ -86,13 +86,22 @@ ros2 launch sysu219_guide_controller gazebo.launch.py policy:=hybrid
 ros2 run keyboard_input keyboard_input
 ```
 
-每次等姿态切换完成，再按下一次 `2`。从 PASSIVE 开始依次进入全趴、半趴和 FIXEDSTAND。站稳后按 `4` 进入踏步，`W/S` 前后，`A/D` 转向，松开运动键回零速踏步。按 `2` 退出踏步并返回站立。
+每次等姿态切换完成，再按下一次 `2`。从 PASSIVE 开始依次进入全趴、半趴和 FIXEDSTAND。用 `policy:=hybrid` 启动时，在 FIXEDSTAND 站稳后按下表的策略键。踏步中按 `2` 回到固定站姿，等站稳再选下一策略。`W/S` 前后，`A/D` 转向，松开运动键回零速踏步。`1` 进被动阻尼，站稳后按 `8` 先半趴再全趴。
 
-## 当前模型
+## v4 对照策略
 
-真机和 Gazebo 在 `policy:=hybrid` 下，从本工程的 `ros2_ws/install/sysu219_guide_controller/share/sysu219_guide_controller/model/` 加载 `pure_hybrid_gait_ppo.onnx` 和同名 JSON。控制器启动日志会打印检查点 SHA，当前检查点轮次和文件校验值见 [v4 模型清单](ros2_ws/src/quadruped_ros2_control-humble/controllers/sysu219_guide_controller/model/pure_hybrid_gait_ppo.json)。
+| 键 | 版本 | 训练检查点 |
+| --- | --- | --- |
+| `3` | 最新 `feature_swing`，摆动中 X 自由，约束 Y 和最高点时机 | `2026-11-24_14-45-10_feature_swing/model_999.pt` |
+| `4` | `apex`，摆线跟踪加中点水平对齐 | `2026-11-24_09-02-12_apex/model_999.pt` |
+| `5` | 真机修复零速后退的基准 | `2026-11-24_04-03-57/model_725.pt` |
+| `6` | `decoupled`，两项零速奖励使用平滑速度 | `2026-11-24_10-13-38_decoupled/model_999.pt` |
+| `7` | `zero_pitch`，俯仰目标 0° | `2026-11-24_12-44-42_zero_pitch/model_999.pt` |
+| `9` | 真机历史最好看步态的基准，零速会后退 | `2026-11-23_23-22-04/model_750.pt` |
 
-带 InEKF 速度观测的 v4 策略为 77 维，在原有 74 维输入末尾追加三轴速度。从 74 维版本更新时，按本文已有的构建命令重新构建 ROS 2 控制器，再重新加载工作区。两个版本均使用 `policy:=hybrid`。
+真机和 Gazebo 沿用原来的键盘通道。`3/4/5/6/7/9` 的旧功能映射已取消，启用 `policy:=hybrid` 后专用于选策略，踏步中按这些键保持当前策略和运动指令。每个策略使用安装目录下的 `model/pure_hybrid_gait_key<N>.onnx`，同名 JSON 可核对轮次和校验值。控制器启动时预加载各策略，空位或模型校验失败时对应按键保持固定站姿。更新模型后需重启控制器以加载新文件。
+
+真机的原地采集在收到原有踏步状态后延迟 0.5 秒开始。采集写入 ROS 2 工作区下的 `log/sysu219_hold/`。
 
 ## 维护
 

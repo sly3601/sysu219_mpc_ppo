@@ -259,6 +259,18 @@ namespace sysu219_guide_controller
                     current_state_ == state_list_.fixedStand))
                 next_state_name_ = FSMStateName::COMIDENTIFICATION;
 
+            if (hybrid_gait_ppo_ && next_state_name_ == FSMStateName::TROTTING &&
+                current_state_ != state_list_.trotting) {
+                const int key = current_state_ == state_list_.fixedStand
+                    ? state_list_.fixedStand->requestedPolicyKey() : 0;
+                if (!state_list_.trotting || !state_list_.trotting->selectHybridPolicy(key)) {
+                    ctrl_interfaces_.control_inputs_.command = 0;
+                    next_state_name_ = current_state_->state_name;
+                    RCLCPP_INFO(get_node()->get_logger(), "[PPO_TROTTING] policy key %d unavailable, holding %s",
+                                key, current_state_->state_name_string.c_str());
+                }
+            }
+
             // The gait/stand profiles expose exactly the states constructed on activation.
             if (!legacyStatesEnabled() && next_state_name_ != current_state_->state_name &&
                 !getNextState(next_state_name_)) {
@@ -789,11 +801,12 @@ namespace sysu219_guide_controller
         state_list_.passive = std::make_shared<StatePassive>(ctrl_interfaces_);
         state_list_.fixedProne = std::make_shared<StateFixedProne>(ctrl_interfaces_, prone_pos_, prone_kp_, prone_kd_);
         state_list_.fixedDown = std::make_shared<StateFixedDown>(ctrl_interfaces_, down_pos_, stand_kp_, stand_kd_);
-        state_list_.fixedStand = std::make_shared<StateFixedStand>(ctrl_interfaces_, stand_pos_, stand_kp_, stand_kd_);
+        state_list_.fixedStand = std::make_shared<StateFixedStand>(
+            ctrl_interfaces_, stand_pos_, stand_kp_, stand_kd_, hybrid_gait_ppo_);
         if (!gazebo_stand_only_) {
             state_list_.trotting = std::make_shared<StateTrotting>(
                 ctrl_interfaces_, ctrl_component_, pure_gait_ppo_, smooth_gait_ppo_, local_gait_ppo_, hybrid_gait_ppo_);
-            if ((smooth_gait_ppo_ || local_gait_ppo_ || hybrid_gait_ppo_) && !state_list_.trotting->ready()) {
+            if ((smooth_gait_ppo_ || local_gait_ppo_ || hybrid_gait_ppo_) && !state_list_.trotting->primaryPolicyReady()) {
                 RCLCPP_ERROR(get_node()->get_logger(), "Could not load the %s PPO controller",
                              hybrid_gait_ppo_ ? "hybrid" : local_gait_ppo_ ? "71-input local" : "74-input smooth");
                 return CallbackReturn::ERROR;

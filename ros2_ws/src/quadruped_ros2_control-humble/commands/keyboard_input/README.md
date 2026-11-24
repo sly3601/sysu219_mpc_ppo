@@ -25,27 +25,25 @@ ros2 run keyboard_input keyboard_input
 ### 1.1 Control Mode
 The keys map directly to the `command` field of `control_input_msgs/msg/Inputs`:
 
+When launched with `policy:=hybrid`, keys `3`, `4`, `5`, `6`, `7`, and `9` select PPO
+policies from settled FIXEDSTAND. Key `3` selects the latest feature-swing policy and key
+`4` selects Apex. These keys are ignored while trotting. Press `2` and wait for FIXEDSTAND
+before selecting another policy. The old assignments for these six keys have been removed.
+
 | Key | command | Effect |
 | --- | --- | --- |
 | 1 | 1 | PASSIVE (kp=0, kd=1 passive damping), always available |
 | 2 | 2 | Cycle the fixed poses: PRONE → DOWN → STAND → DOWN → STAND → ... |
-| 3 | 3 | FREE STAND (only from FIXED STAND) |
-| 4 | 4 | TROTTING (only from FIXED STAND) |
-| 5 | 5 | SWING TEST (only from FIXED STAND) |
-| 6 | 6 | BALANCE TEST (only from FIXED STAND) |
-| 7 | 7 | PPO in-place trot / RLWALK (only from FIXED STAND) |
+| 3–7, 9 | 3–7, 9 | Select the corresponding Hybrid PPO policy from settled FIXEDSTAND |
 | 8 | 8 | PRONE: from FIXED STAND it goes to DOWN first and then continues to PRONE automatically |
-| 9 / 0 | 9 / 10 | Reserved, not handled by the guide controller |
+| 0 | 10 | Reserved |
 
 * Starting from PASSIVE, the first press of `2` goes to PRONE, then DOWN, then STAND, and afterwards
   `2` toggles between DOWN and STAND.
 * `1` switches to PASSIVE from any state, and is not blocked by the pose transition lock.
 * Wait for each fixed-pose transition to finish (about 2 seconds) before pressing the next mode key.
-* In RLWALK, `2` returns to FIXEDSTAND; `1` enters PASSIVE (passive damping, not power-off).
-  To switch between RLWALK and TROTTING, first return to FIXEDSTAND with `2`, wait for its
-  transition to finish, then press `7` for RLWALK or `4` for TROTTING.
-* The in-place PPO ignores WASD/IJKL. Space does not exit RLWALK. Ctrl+C only ends the keyboard
-  node and does not stop the controller's current mode; exit RL with `2` or `1` first.
+* While trotting, `2` returns to FIXEDSTAND and `1` enters PASSIVE. Space clears the walking
+  command. Ctrl+C closes the keyboard node; return to FIXEDSTAND or PASSIVE first.
 
 ### 1.2 Control Input
 * WASD IJKL: Move robot

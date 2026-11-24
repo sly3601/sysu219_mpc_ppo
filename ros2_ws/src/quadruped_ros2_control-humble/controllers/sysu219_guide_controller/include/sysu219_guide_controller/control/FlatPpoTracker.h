@@ -5,6 +5,7 @@
 #include <Eigen/Core>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 struct CtrlInterfaces;
 class WaveGenerator;
@@ -14,7 +15,7 @@ class WaveGenerator;
 class FlatPpoTracker {
 public:
     enum class Mode { FlatMpc, FootTrackingMpc, PureGait, SmoothGait, LocalGait, HybridGait };
-    explicit FlatPpoTracker(CtrlInterfaces& interfaces, Mode mode);
+    explicit FlatPpoTracker(CtrlInterfaces& interfaces, Mode mode, const std::string& model_name = {});
     ~FlatPpoTracker();
     static Eigen::Vector3d boundCommand(const Eigen::Vector3d& command);
     bool ready() const;

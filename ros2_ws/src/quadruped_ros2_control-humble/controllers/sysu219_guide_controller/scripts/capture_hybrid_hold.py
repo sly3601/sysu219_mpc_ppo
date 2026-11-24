@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Passively record short zero-command hardware trots after key 4."""
+"""Passively record short zero-command hardware trots after a policy enters."""
 
 from bisect import bisect_right
 from datetime import datetime
@@ -18,7 +18,7 @@ from std_msgs.msg import Empty
 from tf2_msgs.msg import TFMessage
 
 
-PERIOD_S = 0.975
+PERIOD_S = 0.650
 HALF_PERIOD_S = PERIOD_S / 2
 START_DELAY_S = 0.5
 DURATION_S = 10.0
@@ -28,7 +28,7 @@ STAMP_SKEW_NS = 20_000_000
 SAMPLE_TIMES = (*(i * HALF_PERIOD_S for i in range(math.ceil(DURATION_S / HALF_PERIOD_S))), DURATION_S)
 JOINTS = tuple(f"{leg}_{joint}" for leg in ("FL", "FR", "RL", "RR")
                for joint in ("hip", "thigh", "calf"))
-HEADER = ("t_since_4_s", "phase_approx", "inekf_x_cm", "inekf_y_cm", "pitch_deg", "stamp_skew_ms",
+HEADER = ("t_since_policy_s", "phase_approx", "inekf_x_cm", "inekf_y_cm", "pitch_deg", "stamp_skew_ms",
           *(f"{prefix}_{joint}_deg" for prefix in ("target", "actual") for joint in JOINTS))
 
 
@@ -60,15 +60,6 @@ class HoldCapture(Node):
     def on_control(self, msg):
         if msg.command in (1, 2):
             self.finish()
-            return
-        if msg.command != 4 or self.key_at is not None:
-            return
-        now = time.monotonic()
-        if now - self.last_active <= ACTIVE_GAP_S and now - self.active_since > MESSAGE_ORDER_GRACE_S:
-            return
-        self.key_at = now
-        if self.pose is not None and now - self.pose[1] <= MESSAGE_ORDER_GRACE_S:
-            self.origin = self.pose[2][:3]
 
     def on_tf(self, msg):
         now = time.monotonic()
@@ -101,6 +92,10 @@ class HoldCapture(Node):
         now = time.monotonic()
         if now - self.last_active > ACTIVE_GAP_S:
             self.active_since = now
+            if self.key_at is None:
+                self.key_at = now
+                if self.pose is not None and now - self.pose[1] <= MESSAGE_ORDER_GRACE_S:
+                    self.origin = self.pose[2][:3]
         self.last_active = now
 
     def on_motion(self, msg):

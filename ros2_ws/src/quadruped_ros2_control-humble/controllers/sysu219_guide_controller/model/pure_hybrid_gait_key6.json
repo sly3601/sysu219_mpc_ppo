@@ -1,0 +1,192 @@
+{
+  "checkpoint": "model_999.pt",
+  "checkpoint_sha256": "e8b936f0eea6bfe35a3a0e6c6bb207e2fc033bf6e90e31e2e22c0e6569766c3a",
+  "contract": {
+    "id": "sysu219.pure_hybrid_gait77.v1",
+    "observation_width": 77,
+    "actor_joint_order": [
+      "FL_hip_joint",
+      "FR_hip_joint",
+      "RL_hip_joint",
+      "RR_hip_joint",
+      "FL_thigh_joint",
+      "FR_thigh_joint",
+      "RL_thigh_joint",
+      "RR_thigh_joint",
+      "FL_calf_joint",
+      "FR_calf_joint",
+      "RL_calf_joint",
+      "RR_calf_joint"
+    ],
+    "observation_terms": [
+      "base_ang_vel",
+      "projected_gravity",
+      "velocity_commands",
+      "joint_pos",
+      "joint_vel",
+      "actions",
+      "local_gait_reference",
+      "odometry_position_delta",
+      "odometry_linear_velocity"
+    ],
+    "velocity_frame": "body",
+    "gravity": "world negative unit Z expressed in body frame",
+    "velocity_commands": [
+      "body_vx_m_s",
+      "body_vy_m_s",
+      "body_yaw_rate_rad_s"
+    ],
+    "command_abs_limits": [
+      0.3,
+      0.0,
+      0.3
+    ],
+    "tracking_reference": [],
+    "q0_rad": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.67,
+      0.67,
+      0.67,
+      0.67,
+      -1.3,
+      -1.3,
+      -1.3,
+      -1.3
+    ],
+    "action_scale_rad": 0.25,
+    "last_action": "raw deterministic network output before scaling or deployment joint limits",
+    "policy_period_s": 0.02,
+    "kp": [
+      260.0,
+      260.0,
+      260.0,
+      260.0,
+      260.0,
+      260.0,
+      260.0,
+      260.0,
+      260.0,
+      260.0,
+      260.0,
+      260.0
+    ],
+    "kd": [
+      3.8,
+      3.8,
+      3.8,
+      3.8,
+      3.8,
+      3.8,
+      3.8,
+      3.8,
+      3.8,
+      3.8,
+      3.8,
+      3.8
+    ],
+    "joint_bounds_by_type_rad": [
+      [
+        -0.638,
+        0.748
+      ],
+      [
+        -0.623,
+        1.65
+      ],
+      [
+        -2.322,
+        -0.888
+      ]
+    ],
+    "motor_stall_nm": 200.0,
+    "motor_no_load_rad_s": 22.0,
+    "training_effort_limit_nm": 100.0,
+    "urdf_effort_limit_nm": 100.0,
+    "gait_clock": [
+      "sin(2*pi*cycle)",
+      "cos(2*pi*cycle)"
+    ],
+    "period_s": 0.65,
+    "entry_cycle": 0.5,
+    "stance_ratio": 0.5,
+    "torque_response_time_s": 0.004,
+    "actuation": "PD with zero velocity target and zero feedforward",
+    "entry_duration_s": 0.5,
+    "entry_stiffness": 260.0,
+    "entry_damping": 3.8,
+    "entry_front_hip_thigh_calf_rad": [
+      0.0,
+      0.9,
+      -1.53
+    ],
+    "entry_rear_hip_thigh_calf_rad": [
+      0.0,
+      0.9,
+      -1.3
+    ],
+    "gait_reference_lookahead_s": 0.02,
+    "swing_height_m": 0.07,
+    "controller_period_s": 0.004,
+    "target_smoothing": "exact zero-order hold of two continuous first-order poles",
+    "target_smoothing_each_tau_s": 0.01,
+    "target_smoothing_reset": "measured joint position",
+    "odometry": "original InEKF",
+    "gait_reference": [
+      "gait_clock:sin,cos",
+      "lookahead_nominal_heading_xyz_m_relative_to_base:FR,FL,RR,RL",
+      "lookahead_nominal_relative_velocity_xyz_m_s_held_command:FR,FL,RR,RL"
+    ],
+    "gait_reference_command_filter_tau_s": 0.18,
+    "gait_reference_nominal_centers_m": [
+      [
+        0.2825648552583156,
+        -0.2183,
+        -0.4173655010846403
+      ],
+      [
+        0.2825648552583156,
+        0.2183,
+        -0.4173655010846403
+      ],
+      [
+        -0.4652444922328959,
+        -0.2183,
+        -0.4173655010846403
+      ],
+      [
+        -0.4652444922328959,
+        0.2183,
+        -0.4173655010846403
+      ]
+    ],
+    "gait_phase_source": "shared 250 Hz WaveGenerator control time",
+    "odometry_period_s": 0.004,
+    "odometry_position_delta": {
+      "order": [
+        "x",
+        "y",
+        "z"
+      ],
+      "units": "m",
+      "anchor": "first accepted odometry pose at gait entry",
+      "frame": "entry odometry heading axes in XY and world Z"
+    },
+    "odometry_linear_velocity": {
+      "order": [
+        "vx",
+        "vy",
+        "vz"
+      ],
+      "units": "m/s",
+      "frame": "current odometry heading axes in XY and world Z"
+    }
+  },
+  "contract_sha256": "4e59ccf367ca6e9de22f18127448059f482187b8da137e26ea765398bc2b61bc",
+  "onnx_sha256": "e417d6151ef5ac2f88b7ebe40de55d28dcdb52dc4b2f24168e56fddfeff07e20",
+  "onnx_reference_vs_torch_max_abs": 2.384185791015625e-06,
+  "run": "2026-11-24_10-13-38_decoupled",
+  "keyboard_slot": 6
+}

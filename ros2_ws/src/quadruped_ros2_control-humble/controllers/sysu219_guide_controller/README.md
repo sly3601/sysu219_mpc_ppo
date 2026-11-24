@@ -94,17 +94,18 @@ that disables the motors; every other state holds the joints with the MIT gains 
 | `BALANCETEST` | Foot force distribution test |
 | `RLWALK` | Reinforcement learning policy walk |
 
+For `policy:=hybrid`, keys `3`, `4`, `5`, `6`, `7`, and `9` select PPO models only
+after the FIXEDSTAND transition finishes. Return to FIXEDSTAND with `2` before selecting
+another policy. Key `3` selects the latest feature-swing policy and key `4` selects Apex.
+An empty slot keeps the robot in FIXEDSTAND.
+
 Key mapping (`commands/keyboard_input`, same `command` ids as the gamepad nodes):
 
 | Key | `command` | `PASSIVE` | `FIXEDPRONE` | `FIXEDDOWN` | `FIXEDSTAND` | `FREESTAND`/`TROTTING`/`SWINGTEST`/`BALANCETEST`/`RLWALK` |
 | --- | --- | --- | --- | --- | --- | --- |
 | `1` | 1 | — | `PASSIVE` | `PASSIVE` | `PASSIVE` | `PASSIVE` |
 | `2` | 2 | `FIXEDPRONE` | `FIXEDDOWN` | `FIXEDSTAND` | `FIXEDDOWN` | `FIXEDSTAND` |
-| `3` | 3 | — | — | — | `FREESTAND` | — |
-| `4` | 4 | — | — | — | `TROTTING` | — |
-| `5` | 5 | — | — | — | `SWINGTEST` | — |
-| `6` | 6 | — | — | — | `BALANCETEST` | — |
-| `7` | 7 | — | — | — | `RLWALK` | — |
+| `3–7, 9` | 3–7, 9 | — | — | — | Hybrid PPO policy slot | — |
 | `8` | 8 | — | — | `FIXEDPRONE` | `FIXEDDOWN`, then `FIXEDPRONE` | — |
 
 Notes:

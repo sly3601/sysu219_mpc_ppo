@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -29,8 +30,11 @@ public:
     FSMStateName checkChange() override;
 
     bool faulted() const { return fault_; }
-    bool ready() const { return tracker_.ready(); }
+    bool ready() const { return active_tracker_ && active_tracker_->ready(); }
+    bool primaryPolicyReady() const { return tracker_.ready(); }
     bool usesEqualHybridPhases() const { return tracker_.usesEqualHybridPhases(); }
+    static bool isHybridPolicyKey(int key);
+    bool selectHybridPolicy(int key);
     bool jointFeedbackValid() const;
     double getFilteredYawRateGlobal() const { return (rotation_ * gyro_)(2); }
 
@@ -59,6 +63,10 @@ private:
     const bool hybrid_gait_;
     std::unique_ptr<GaitGenerator> gait_;
     FlatPpoTracker tracker_;
+    static constexpr std::array<int, 6> hybrid_policy_keys_{3, 4, 5, 6, 7, 9};
+    std::array<std::unique_ptr<FlatPpoTracker>, hybrid_policy_keys_.size()> hybrid_trackers_;
+    FlatPpoTracker* active_tracker_;
+    int selected_key_ = 0;
     std::unique_ptr<quadruped_controller::FootMarkerPublisher> markers_;
     unsigned marker_tick_ = 0;
     sysu219_guide_controller::ContactCoordinator coordinator_;
