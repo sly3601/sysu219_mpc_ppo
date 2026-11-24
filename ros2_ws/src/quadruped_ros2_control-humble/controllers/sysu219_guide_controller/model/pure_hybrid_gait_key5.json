@@ -1,9 +1,9 @@
 {
-  "checkpoint": "model_725.pt",
-  "checkpoint_sha256": "d68847d6e41f9856176e6571c757c4f55d84a26145eb38a66743653d8b848cac",
+  "checkpoint": "model_175.pt",
+  "checkpoint_sha256": "f40b357bfa65caf76bc6fa8827ec2c9e393535b7b0fd316c3ef0e8fadc8d93cb",
   "contract": {
-    "id": "sysu219.pure_hybrid_gait77.v1",
-    "observation_width": 77,
+    "id": "sysu219.pure_hybrid_gait75.xy_hold.v1",
+    "observation_width": 75,
     "actor_joint_order": [
       "FL_hip_joint",
       "FR_hip_joint",
@@ -38,7 +38,7 @@
     ],
     "command_abs_limits": [
       0.3,
-      0.0,
+      0.04,
       0.3
     ],
     "tracking_reference": [],
@@ -167,26 +167,67 @@
     "odometry_position_delta": {
       "order": [
         "x",
-        "y",
-        "z"
+        "y"
       ],
       "units": "m",
       "anchor": "first accepted odometry pose at gait entry",
-      "frame": "entry odometry heading axes in XY and world Z"
+      "frame": "fixed entry odometry heading axes in XY"
     },
     "odometry_linear_velocity": {
       "order": [
         "vx",
-        "vy",
-        "vz"
+        "vy"
       ],
       "units": "m/s",
-      "frame": "current odometry heading axes in XY and world Z"
+      "frame": "fixed entry odometry heading axes in XY"
+    },
+    "odometry_policy_filter": {
+      "period_s": 0.02,
+      "stages": 2,
+      "tau_per_stage_s": 1.0,
+      "update": "first-order low-pass; the second stage uses the updated first stage",
+      "reset": "seed both stages from the first input at gait entry"
+    },
+    "operator_command_abs_limits": [
+      0.3,
+      0.0,
+      0.3
+    ],
+    "odometry_hold_feedback": {
+      "input_order": [
+        "x",
+        "y",
+        "vx",
+        "vy"
+      ],
+      "input_frame": "fixed entry odometry heading axes in XY",
+      "input_source": "InEKF before the separate two-stage actor observation filter",
+      "period_s": 0.02,
+      "median_window_samples": 3,
+      "average_window_s": 0.65,
+      "average_window_samples": 33,
+      "average_oldest_sample_weight": 0.5,
+      "average_weight_sum": 32.5,
+      "low_pass_tau_s": 0.25,
+      "filter_reset": "seed all filter history from the first motion sample",
+      "active_when": "all operator commands are zero",
+      "target_position": "latch the filtered position on entering zero command",
+      "position_deadband_m": 0.015,
+      "velocity_deadband_m_s": 0.008,
+      "position_gain_per_s": 0.35,
+      "velocity_gain": 0.6,
+      "trim_abs_limits_m_s": [
+        0.05,
+        0.04
+      ],
+      "trim_slew_limit_m_s2": 0.025,
+      "inactive_behavior": "slew trim toward zero",
+      "output": "rotate XY trim into current odometry heading, clamp lateral trim to 0.04 m/s, add to both actor command and local gait reference"
     }
   },
-  "contract_sha256": "4e59ccf367ca6e9de22f18127448059f482187b8da137e26ea765398bc2b61bc",
-  "onnx_sha256": "474185b81fbd0d29449e4556fbfedf441222a59e291395e92ffe82af41f2f3c0",
-  "onnx_reference_vs_torch_max_abs": 9.5367431640625e-07,
-  "run": "2026-11-24_04-03-57",
+  "contract_sha256": "e232761e259c78810a7a200f6783ba9d718c9f5fd6661cb222c9270e57cbe8aa",
+  "onnx_sha256": "cfdfc2e1d4ff52b0e20c057ec3cafa4c14d261514e60ede00fc65bac3e08d274",
+  "onnx_reference_vs_torch_max_abs": 2.86102294921875e-06,
+  "run": "2026-11-24_18-57-54_key4_xy_odometry_hold",
   "keyboard_slot": 5
 }
