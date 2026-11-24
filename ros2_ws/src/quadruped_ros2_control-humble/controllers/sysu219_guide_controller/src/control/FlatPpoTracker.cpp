@@ -121,7 +121,8 @@ public:
     using Sample = std::array<float, 4>;  // x, y, vx, vy in the fixed entry-heading frame.
 
     explicit PlanarOdometryHold(bool strongerLateralHold)
-        : positionGain_{0.35f, strongerLateralHold ? 0.50f : 0.35f},
+        : positionGain_{0.35f, strongerLateralHold ? 2.50f : 0.35f},
+          positionDeadband_{0.015f, strongerLateralHold ? 0.01f : 0.015f},
           trimLimit_{0.05f, strongerLateralHold ? 0.06f : 0.04f} {}
 
     void reset() {
@@ -156,7 +157,7 @@ public:
         for (std::size_t axis = 0; axis < entryTrim_.size(); ++axis) {
             float desired = 0.f;
             if (active) {
-                const float positionError = deadband(anchor_[axis] - filtered_[axis], 0.015f);
+                const float positionError = deadband(anchor_[axis] - filtered_[axis], positionDeadband_[axis]);
                 const float speedError = deadband(filtered_[axis + 2], 0.008f);
                 desired = std::clamp(positionGain_[axis] * positionError - 0.6f * speedError,
                                      -trimLimit_[axis], trimLimit_[axis]);
@@ -178,6 +179,7 @@ private:
     inline static const float kFilterAlpha = static_cast<float>(-std::expm1(-kPeriod / 0.25));
     static constexpr float kMaxTrimStep = static_cast<float>(0.025 * kPeriod);
     const std::array<float, 2> positionGain_;
+    const std::array<float, 2> positionDeadband_;
     const std::array<float, 2> trimLimit_;
 
     Sample previous_{}, older_{}, filtered_{};
