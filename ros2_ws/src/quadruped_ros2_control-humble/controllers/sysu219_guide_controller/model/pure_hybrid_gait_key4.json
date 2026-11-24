@@ -1,9 +1,9 @@
 {
-  "checkpoint": "model_999.pt",
-  "checkpoint_sha256": "3a5abc03bf12ad3e6e2bd27198c1ada6335c6da1015290c3665b043bac0fc233",
+  "checkpoint": "model_725.pt",
+  "checkpoint_sha256": "9210f55aef73117497eace91f10e6d8e3b3f9470b023b9f0726e8f9b9718f7ee",
   "contract": {
-    "id": "sysu219.pure_hybrid_gait77.v1",
-    "observation_width": 77,
+    "id": "sysu219.pure_hybrid_gait75.filtered_odom.v1",
+    "observation_width": 75,
     "actor_joint_order": [
       "FL_hip_joint",
       "FR_hip_joint",
@@ -167,26 +167,31 @@
     "odometry_position_delta": {
       "order": [
         "x",
-        "y",
-        "z"
+        "y"
       ],
       "units": "m",
       "anchor": "first accepted odometry pose at gait entry",
-      "frame": "entry odometry heading axes in XY and world Z"
+      "frame": "fixed entry odometry heading axes in XY"
     },
     "odometry_linear_velocity": {
       "order": [
         "vx",
-        "vy",
-        "vz"
+        "vy"
       ],
       "units": "m/s",
-      "frame": "current odometry heading axes in XY and world Z"
+      "frame": "fixed entry odometry heading axes in XY"
+    },
+    "odometry_policy_filter": {
+      "period_s": 0.02,
+      "stages": 2,
+      "tau_per_stage_s": 1.0,
+      "update": "first-order low-pass; the second stage uses the updated first stage",
+      "reset": "seed both stages from the first input at gait entry"
     }
   },
-  "contract_sha256": "4e59ccf367ca6e9de22f18127448059f482187b8da137e26ea765398bc2b61bc",
-  "onnx_sha256": "b78173941730a3c51feac7d4fdfadc682d8aed820fd89bf41bf9b4f4937d1a79",
+  "contract_sha256": "40935967948bccd657c3cbdee7e6d9980e0d7d62d90ebadcdf581ac8dafce298",
+  "onnx_sha256": "0e6a0754d97f7d61324a1335f6bd331433c466bfef159b24a509265f3c53ed40",
   "onnx_reference_vs_torch_max_abs": 1.9073486328125e-06,
-  "run": "2026-11-24_09-02-12_apex",
+  "run": "2026-11-24_17-36-14_key9_filtered_xy_rear_force",
   "keyboard_slot": 4
 }
