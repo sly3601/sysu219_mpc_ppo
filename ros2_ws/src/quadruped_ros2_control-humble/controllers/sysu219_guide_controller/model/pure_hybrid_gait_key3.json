@@ -1,9 +1,9 @@
 {
-  "checkpoint": "model_999.pt",
-  "checkpoint_sha256": "8e73776936ea949842870fd61bfda868623258ba39feabbc90ed778f78497470",
+  "checkpoint": "model_75.pt",
+  "checkpoint_sha256": "af4eccf392c49476ab952ffb99fedfa1fbb4f9c26fc23aa4b52e37c484843da7",
   "contract": {
-    "id": "sysu219.pure_hybrid_gait77.v1",
-    "observation_width": 77,
+    "id": "sysu219.pure_hybrid_gait75.filtered_odom.v1",
+    "observation_width": 75,
     "actor_joint_order": [
       "FL_hip_joint",
       "FR_hip_joint",
@@ -167,27 +167,31 @@
     "odometry_position_delta": {
       "order": [
         "x",
-        "y",
-        "z"
+        "y"
       ],
       "units": "m",
       "anchor": "first accepted odometry pose at gait entry",
-      "frame": "entry odometry heading axes in XY and world Z"
+      "frame": "fixed entry odometry heading axes in XY"
     },
     "odometry_linear_velocity": {
       "order": [
         "vx",
-        "vy",
-        "vz"
+        "vy"
       ],
       "units": "m/s",
-      "frame": "current odometry heading axes in XY and world Z"
+      "frame": "fixed entry odometry heading axes in XY"
+    },
+    "odometry_policy_filter": {
+      "period_s": 0.02,
+      "stages": 2,
+      "tau_per_stage_s": 1.0,
+      "update": "first-order low-pass; the second stage uses the updated first stage",
+      "reset": "seed both stages from the first input at gait entry"
     }
   },
-  "contract_sha256": "4e59ccf367ca6e9de22f18127448059f482187b8da137e26ea765398bc2b61bc",
-  "onnx_sha256": "63acb9cda52ede0d73ab53e96d545215eef6b55862bc63f6f9a11c847e5f0af4",
-  "onnx_reference_vs_torch_max_abs": 1.9073486328125e-06,
-  "run": "2026-11-24_14-45-10_feature_swing",
-  "feature_swing": true,
+  "contract_sha256": "40935967948bccd657c3cbdee7e6d9980e0d7d62d90ebadcdf581ac8dafce298",
+  "onnx_sha256": "ddf9cfd3e7a1f4f8f9974d44080ab74ca7c8b0fe0ac45ab8a0d26db77300f84f",
+  "onnx_reference_vs_torch_max_abs": 1.430511474609375e-06,
+  "run": "2026-11-24_17-04-48_key9_filtered_xy",
   "keyboard_slot": 3
 }
