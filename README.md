@@ -105,7 +105,7 @@ ros2 run keyboard_input keyboard_input
 
 零速踏步时，`3`、`4` 和 `5` 用训练时的原始 InEKF 外层纠偏，Y 位置增益为 0.50 s⁻¹、位置死区为 1.5 cm，横向纠偏上限为 ±0.06 m/s。`6` 对应 2.50 s⁻¹、1 cm 和 ±0.06 m/s。首次加载新版 `3`、`4`、`5` 需要重新编译 `sysu219_guide_controller`。
 
-`9` 在站立过渡完成且运动指令归零时锁定滤波后的 InEKF 位置和当时的前向。沿这个方向的后退误差给正 `vx` 补偿。参数集中在 `sysu219_description/config/pure_hybrid_gait_ppo.yaml` 的 `rl_key9_hold_*`。默认 `Kp=0.50`、`Kd=0.0`、位置死区 1 cm、补偿上限 ±0.06 m/s。`Kd` 直接作用于滤波后的 InEKF 速度。首次使用要重新编译控制器，之后调参并重启即可。
+`9` 在站立过渡完成且运动指令归零时锁定滤波后的 InEKF 位置和当时的前向。沿这个方向的后退误差给正 `vx` 补偿。参数集中在 `sysu219_description/config/pure_hybrid_gait_ppo.yaml` 的 `rl_key9_hold_*`。该文件设置 `Kp=0.50`、`Kd=0.0`、位置死区 1 cm，补偿上限为训练时的前后速度指令范围 ±0.30 m/s。`Kd` 直接作用于滤波后的 InEKF 速度。首次使用要重新编译控制器，之后调参并重启即可。
 
 真机和 Gazebo 沿用原来的键盘通道。`3/4/5/6/7/9` 的旧功能映射已取消，启用 `policy:=hybrid` 后专用于选策略，踏步中按这些键保持当前策略和运动指令。每个策略使用安装目录下的 `model/pure_hybrid_gait_key<N>.onnx`，同名 JSON 可核对轮次和校验值。控制器启动时预加载各策略，空位或模型校验失败时对应按键保持固定站姿。更新模型后需重启控制器以加载新文件。
 
