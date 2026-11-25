@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -44,6 +45,7 @@ constexpr char kHybridFilteredOdometryContract[] = "40935967948bccd657c3cbdee7e6
 constexpr char kHybridXYHoldId[] = "sysu219.pure_hybrid_gait75.xy_hold.v1";
 constexpr char kHybridXYHoldContract[] = "e232761e259c78810a7a200f6783ba9d718c9f5fd6661cb222c9270e57cbe8aa";
 constexpr char kHybridXYHoldObservationTrialContract[] = "c44dc19c28718d283f2919867f77c85bd0fb8635c662d3ab4730513940ce8dca";
+constexpr char kKey9Checkpoint[] = "5b5db66f4034be1412bea800a45af0e18703aaf7c778d4b9ecb2481f1a1d0b73";
 constexpr char kFlatCheckpoint[] = "5d16c702b3bba579830968f16c85722dbb06d75e7f1b6efd922fef3010363228";
 constexpr char kFlatContract[] = "e0f63c48ba5536a61af412bffd122f650b3a18fed27b0f3210f9465d61c8d4ba";
 constexpr char kTrackingContract[] = "930d512bfd01635766017ffa1368a462b5c42879b034827256b82d815737dd65";
@@ -121,6 +123,24 @@ class PlanarOdometryHold {
 public:
     using Sample = std::array<float, 4>;  // x, y, vx, vy in the fixed entry-heading frame.
 
+    struct ForwardParameters {
+        float kp;
+        float kd;
+        float positionDeadband;
+        float trimLimit;
+    };
+
+    void configureForward(ForwardParameters parameters) {
+        const auto [kp, kd, positionDeadband, trimLimit] = parameters;
+        if (!std::isfinite(kp) || kp < 0.f || !std::isfinite(kd) || kd < 0.f ||
+            !std::isfinite(positionDeadband) || positionDeadband < 0.f ||
+            !std::isfinite(trimLimit) || trimLimit < 0.f || trimLimit > 0.3f)
+            throw std::runtime_error("Invalid key 9 forward hold parameters");
+        forward_ = parameters;
+    }
+
+    bool usesForwardHold() const { return forward_.has_value(); }
+
     void configureLateral(float positionGain, float positionDeadband, float trimLimit) {
         positionGain_[1] = positionGain;
         positionDeadband_[1] = positionDeadband;
@@ -154,8 +174,27 @@ public:
         older_ = previous_;
         previous_ = motion;
 
-        if (active && !active_) anchor_ = {filtered_[0], filtered_[1]};
+        const auto c = static_cast<float>(std::cos(relativeYaw));
+        const auto s = static_cast<float>(std::sin(relativeYaw));
+        if (active && !active_) {
+            anchor_ = {filtered_[0], filtered_[1]};
+            if (forward_) forwardAxis_ = {c, s};
+        }
         active_ = active;
+        if (forward_) {
+            float desired = 0.f;
+            if (active) {
+                const auto& [kp, kd, positionDeadband, trimLimit] = *forward_;
+                const float positionError = forwardAxis_[0] * (anchor_[0] - filtered_[0]) +
+                                            forwardAxis_[1] * (anchor_[1] - filtered_[1]);
+                const float measuredSpeed = forwardAxis_[0] * filtered_[2] + forwardAxis_[1] * filtered_[3];
+                const float alignment = c * forwardAxis_[0] + s * forwardAxis_[1];
+                const float correction = kp * deadband(positionError, positionDeadband) - kd * measuredSpeed;
+                desired = std::clamp(alignment * correction, -trimLimit, trimLimit);
+            }
+            entryTrim_[0] += std::clamp(desired - entryTrim_[0], -kMaxTrimStep, kMaxTrimStep);
+            return {entryTrim_[0], 0.0};
+        }
         for (std::size_t axis = 0; axis < entryTrim_.size(); ++axis) {
             float desired = 0.f;
             if (active) {
@@ -166,8 +205,6 @@ public:
             }
             entryTrim_[axis] += std::clamp(desired - entryTrim_[axis], -kMaxTrimStep, kMaxTrimStep);
         }
-        const auto c = static_cast<float>(std::cos(relativeYaw));
-        const auto s = static_cast<float>(std::sin(relativeYaw));
         const float bodyX = c * entryTrim_[0] + s * entryTrim_[1];
         const float bodyY = -s * entryTrim_[0] + c * entryTrim_[1];
         return {bodyX, std::clamp(bodyY, -trimLimit_[1], trimLimit_[1])};
@@ -183,6 +220,8 @@ private:
     std::array<float, 2> positionGain_{0.35f, 0.35f};
     std::array<float, 2> positionDeadband_{0.015f, 0.015f};
     std::array<float, 2> trimLimit_{0.05f, 0.04f};
+    std::optional<ForwardParameters> forward_;
+    std::array<float, 2> forwardAxis_{1.f, 0.f};
 
     Sample previous_{}, older_{}, filtered_{};
     std::array<Sample, 33> window_{};
@@ -301,6 +340,15 @@ struct FlatPpoTracker::Impl {
             planarHold.configureLateral(0.50f, 0.015f, 0.06f);
         } else if (hybrid_xy_hold && path.filename() == "pure_hybrid_gait_key6.onnx") {
             planarHold.configureLateral(2.50f, 0.01f, 0.06f);
+        } else if (equal_hybrid_phases && sha == kKey9Checkpoint && path.filename() == "pure_hybrid_gait_key9.onnx") {
+            const PlanarOdometryHold::ForwardParameters hold{
+                static_cast<float>(io.node->get_parameter("rl_key9_hold_kp").as_double()),
+                static_cast<float>(io.node->get_parameter("rl_key9_hold_kd").as_double()),
+                static_cast<float>(io.node->get_parameter("rl_key9_hold_position_deadband_m").as_double()),
+                static_cast<float>(io.node->get_parameter("rl_key9_hold_max_trim_m_s").as_double())};
+            planarHold.configureForward(hold);
+            RCLCPP_INFO(io.node->get_logger(), "Key 9 forward hold: Kp=%.3f Kd=%.3f deadband=%.3f m trim=%.3f m/s",
+                        hold.kp, hold.kd, hold.positionDeadband, hold.trimLimit);
         }
         checkTensor(session->GetInputTypeInfo(0), policy.width);
         const std::array<int64_t, 2> inShape{1, policy.width}, outShape{1, 12};
@@ -450,35 +498,39 @@ struct FlatPpoTracker::Impl {
             const Eigen::Vector3d delta = hybrid->position - hybridPositionOrigin;
             obs[kLocalGaitWidth] = static_cast<float>(hybridHeading.dot(delta.head<2>()));
             obs[kLocalGaitWidth + 1] = static_cast<float>(-hybridHeading.y() * delta.x() + hybridHeading.x() * delta.y());
-            if (hybrid_filtered_odometry) {
-                const auto& v = hybrid->velocity;
+            const bool forwardHold = planarHold.usesForwardHold();
+            if (hybrid_filtered_odometry || forwardHold) {
+                Eigen::Vector2d v = hybrid->velocity.head<2>();
+                if (!v.allFinite()) v.setZero();
                 // The training filter sees both XY vectors in the same fixed entry-yaw frame.
                 const PlanarOdometryHold::Sample measurement{
                     obs[kLocalGaitWidth], obs[kLocalGaitWidth + 1],
-                    static_cast<float>(hybridHeading.dot(v.head<2>())),
+                    static_cast<float>(hybridHeading.dot(v)),
                     static_cast<float>(-hybridHeading.y() * v.x() + hybridHeading.x() * v.y())};
-                // Training first advances hold feedback after the gait-entry sample.
-                if (hybrid_xy_hold && started) {
+                if ((hybrid_xy_hold || forwardHold) && started) {
                     for (const float value : measurement) checked(value);
-                    const auto trim = planarHold.advance(measurement, (cmd.array() == 0.).all(),
-                                                         hybrid->yaw - hybridEntryYaw);
+                    const bool idle = (cmd.array() == 0.).all() && (!forwardHold || elapsed >= transition);
+                    const auto trim = planarHold.advance(measurement, idle, hybrid->yaw - hybridEntryYaw);
                     if (!lateralCommand) bounded.head<2>() += trim;
                     bounded.x() = std::clamp(bounded.x(), -0.3, 0.3);
                     obs[feedbackOffset + 6] = static_cast<float>(bounded.x());
                     obs[feedbackOffset + 7] = static_cast<float>(bounded.y());
                 }
-                if (!started) {
-                    hybridOdometryFirstPole = hybridOdometrySecondPole = measurement;
-                } else {
-                    for (std::size_t i = 0; i < measurement.size(); ++i) {
-                        auto& first = hybridOdometryFirstPole[i];
-                        auto& second = hybridOdometrySecondPole[i];
-                        first += kHybridOdometryAlpha * (measurement[i] - first);
-                        second += kHybridOdometryAlpha * (first - second);
+                if (hybrid_filtered_odometry) {
+                    if (!started) {
+                        hybridOdometryFirstPole = hybridOdometrySecondPole = measurement;
+                    } else {
+                        for (std::size_t i = 0; i < measurement.size(); ++i) {
+                            auto& first = hybridOdometryFirstPole[i];
+                            auto& second = hybridOdometrySecondPole[i];
+                            first += kHybridOdometryAlpha * (measurement[i] - first);
+                            second += kHybridOdometryAlpha * (first - second);
+                        }
                     }
+                    std::copy(hybridOdometrySecondPole.begin(), hybridOdometrySecondPole.end(), obs.begin() + kLocalGaitWidth);
                 }
-                std::copy(hybridOdometrySecondPole.begin(), hybridOdometrySecondPole.end(), obs.begin() + kLocalGaitWidth);
-            } else {
+            }
+            if (!hybrid_filtered_odometry) {
                 obs[kLocalGaitWidth + 2] = static_cast<float>(delta.z());
             }
             if (hybrid_velocity) {

@@ -473,6 +473,10 @@ namespace sysu219_guide_controller
             auto_declare<bool>("mpc_ppo_foot_tracking", false);
             auto_declare<int>("rl_policy_id", 3);
             auto_declare<double>("rl_pose_transition_s", 0.5);
+            auto_declare<double>("rl_key9_hold_kp", 0.50);
+            auto_declare<double>("rl_key9_hold_kd", 0.0);
+            auto_declare<double>("rl_key9_hold_position_deadband_m", 0.01);
+            auto_declare<double>("rl_key9_hold_max_trim_m_s", 0.06);
             auto_declare<double>("rl_entry_timeout_s", 5.0);
             auto_declare<double>("rl_entry_tolerance_rad", 0.25);
             auto_declare<double>("rl_entry_velocity_rad_s", 1.0);
