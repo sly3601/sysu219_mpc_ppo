@@ -16,3 +16,6 @@ sysu219_guide_controller:
     rl_key9_hold_kd: 0.0
     rl_key9_hold_position_deadband_m: 0.01
     rl_key9_hold_max_trim_m_s: 0.30
+    rl_key9_hold_position_cutoff_hz: 10.0
+    rl_key9_hold_velocity_cutoff_hz: 10.0
+    rl_key9_hold_trim_slew_m_s2: 0.12

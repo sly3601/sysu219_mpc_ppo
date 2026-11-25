@@ -128,14 +128,30 @@ public:
         float kd;
         float positionDeadband;
         float trimLimit;
+        float positionCutoffHz;
+        float velocityCutoffHz;
+        float trimSlew;
     };
 
     void configureForward(ForwardParameters parameters) {
-        const auto [kp, kd, positionDeadband, trimLimit] = parameters;
+        const auto [kp, kd, positionDeadband, trimLimit, positionCutoffHz, velocityCutoffHz, trimSlew] = parameters;
+        constexpr double nyquistHz = 0.5 / kPeriod;
         if (!std::isfinite(kp) || kp < 0.f || !std::isfinite(kd) || kd < 0.f ||
             !std::isfinite(positionDeadband) || positionDeadband < 0.f ||
-            !std::isfinite(trimLimit) || trimLimit < 0.f || trimLimit > 0.3f)
+            !std::isfinite(trimLimit) || trimLimit < 0.f || trimLimit > 0.3f ||
+            !std::isfinite(positionCutoffHz) || positionCutoffHz <= 0.f || positionCutoffHz >= nyquistHz ||
+            !std::isfinite(velocityCutoffHz) || velocityCutoffHz <= 0.f || velocityCutoffHz >= nyquistHz ||
+            !std::isfinite(trimSlew) || trimSlew <= 0.f)
             throw std::runtime_error("Invalid key 9 forward hold parameters");
+        const auto lowPassAlpha = [](double cutoffHz) {
+            constexpr double pi = 3.14159265358979323846;
+            const double sine = std::sin(pi * cutoffHz * kPeriod);
+            // Set the digital one-pole filter's -3 dB frequency at 50 Hz sampling.
+            return static_cast<float>(2.0 * sine / (std::sqrt(1.0 + sine * sine) + sine));
+        };
+        forwardPositionAlpha_ = lowPassAlpha(positionCutoffHz);
+        forwardVelocityAlpha_ = lowPassAlpha(velocityCutoffHz);
+        forwardMaxTrimStep_ = static_cast<float>(trimSlew * kPeriod);
         forward_ = parameters;
     }
 
@@ -157,19 +173,29 @@ public:
     Eigen::Vector2d advance(const Sample& motion, bool active, double relativeYaw) {
         if (seedPending_) {
             previous_ = older_ = filtered_ = motion;
-            window_.fill(motion);
+            if (!forward_) window_.fill(motion);
             seedPending_ = false;
         }
-        auto& sample = window_[nextSample_];
-        nextSample_ = (nextSample_ + 1) % window_.size();
+        Sample median{};
         for (std::size_t axis = 0; axis < motion.size(); ++axis) {
-            sample[axis] = std::clamp(motion[axis], std::min(previous_[axis], older_[axis]),
-                                      std::max(previous_[axis], older_[axis]));
-            float sum = 0.f;
-            for (const auto& value : window_) sum += value[axis];
-            // At 50 Hz a 0.65-s gait period spans 32.5 samples.
-            const float mean = (sum - 0.5f * window_[nextSample_][axis]) / 32.5f;
-            filtered_[axis] += kFilterAlpha * (mean - filtered_[axis]);
+            median[axis] = std::clamp(motion[axis], std::min(previous_[axis], older_[axis]),
+                                     std::max(previous_[axis], older_[axis]));
+        }
+        if (forward_) {
+            for (std::size_t axis = 0; axis < motion.size(); ++axis) {
+                const float alpha = axis < 2 ? forwardPositionAlpha_ : forwardVelocityAlpha_;
+                filtered_[axis] += alpha * (median[axis] - filtered_[axis]);
+            }
+        } else {
+            window_[nextSample_] = median;
+            nextSample_ = (nextSample_ + 1) % window_.size();
+            for (std::size_t axis = 0; axis < motion.size(); ++axis) {
+                float sum = 0.f;
+                for (const auto& value : window_) sum += value[axis];
+                // At 50 Hz a 0.65-s gait period spans 32.5 samples.
+                const float mean = (sum - 0.5f * window_[nextSample_][axis]) / 32.5f;
+                filtered_[axis] += kFilterAlpha * (mean - filtered_[axis]);
+            }
         }
         older_ = previous_;
         previous_ = motion;
@@ -184,15 +210,16 @@ public:
         if (forward_) {
             float desired = 0.f;
             if (active) {
-                const auto& [kp, kd, positionDeadband, trimLimit] = *forward_;
+                const auto& hold = *forward_;
                 const float positionError = forwardAxis_[0] * (anchor_[0] - filtered_[0]) +
                                             forwardAxis_[1] * (anchor_[1] - filtered_[1]);
                 const float measuredSpeed = forwardAxis_[0] * filtered_[2] + forwardAxis_[1] * filtered_[3];
                 const float alignment = c * forwardAxis_[0] + s * forwardAxis_[1];
-                const float correction = kp * deadband(positionError, positionDeadband) - kd * measuredSpeed;
-                desired = std::clamp(alignment * correction, -trimLimit, trimLimit);
+                const float correction = hold.kp * deadband(positionError, hold.positionDeadband) -
+                                         hold.kd * measuredSpeed;
+                desired = std::clamp(alignment * correction, -hold.trimLimit, hold.trimLimit);
             }
-            entryTrim_[0] += std::clamp(desired - entryTrim_[0], -kMaxTrimStep, kMaxTrimStep);
+            entryTrim_[0] += std::clamp(desired - entryTrim_[0], -forwardMaxTrimStep_, forwardMaxTrimStep_);
             return {entryTrim_[0], 0.0};
         }
         for (std::size_t axis = 0; axis < entryTrim_.size(); ++axis) {
@@ -221,6 +248,9 @@ private:
     std::array<float, 2> positionDeadband_{0.015f, 0.015f};
     std::array<float, 2> trimLimit_{0.05f, 0.04f};
     std::optional<ForwardParameters> forward_;
+    float forwardPositionAlpha_ = 0.f;
+    float forwardVelocityAlpha_ = 0.f;
+    float forwardMaxTrimStep_ = 0.f;
     std::array<float, 2> forwardAxis_{1.f, 0.f};
 
     Sample previous_{}, older_{}, filtered_{};
@@ -345,10 +375,16 @@ struct FlatPpoTracker::Impl {
                 static_cast<float>(io.node->get_parameter("rl_key9_hold_kp").as_double()),
                 static_cast<float>(io.node->get_parameter("rl_key9_hold_kd").as_double()),
                 static_cast<float>(io.node->get_parameter("rl_key9_hold_position_deadband_m").as_double()),
-                static_cast<float>(io.node->get_parameter("rl_key9_hold_max_trim_m_s").as_double())};
+                static_cast<float>(io.node->get_parameter("rl_key9_hold_max_trim_m_s").as_double()),
+                static_cast<float>(io.node->get_parameter("rl_key9_hold_position_cutoff_hz").as_double()),
+                static_cast<float>(io.node->get_parameter("rl_key9_hold_velocity_cutoff_hz").as_double()),
+                static_cast<float>(io.node->get_parameter("rl_key9_hold_trim_slew_m_s2").as_double())};
             planarHold.configureForward(hold);
-            RCLCPP_INFO(io.node->get_logger(), "Key 9 forward hold: Kp=%.3f Kd=%.3f deadband=%.3f m trim=%.3f m/s",
-                        hold.kp, hold.kd, hold.positionDeadband, hold.trimLimit);
+            RCLCPP_INFO(io.node->get_logger(),
+                        "Key 9 forward hold: Kp=%.3f Kd=%.3f deadband=%.3f m trim=%.3f m/s "
+                        "pos_cutoff=%.1f Hz vel_cutoff=%.1f Hz slew=%.3f m/s^2",
+                        hold.kp, hold.kd, hold.positionDeadband, hold.trimLimit,
+                        hold.positionCutoffHz, hold.velocityCutoffHz, hold.trimSlew);
         }
         checkTensor(session->GetInputTypeInfo(0), policy.width);
         const std::array<int64_t, 2> inShape{1, policy.width}, outShape{1, 12};

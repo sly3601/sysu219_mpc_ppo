@@ -477,6 +477,9 @@ namespace sysu219_guide_controller
             auto_declare<double>("rl_key9_hold_kd", 0.0);
             auto_declare<double>("rl_key9_hold_position_deadband_m", 0.01);
             auto_declare<double>("rl_key9_hold_max_trim_m_s", 0.06);
+            auto_declare<double>("rl_key9_hold_position_cutoff_hz", 10.0);
+            auto_declare<double>("rl_key9_hold_velocity_cutoff_hz", 10.0);
+            auto_declare<double>("rl_key9_hold_trim_slew_m_s2", 0.12);
             auto_declare<double>("rl_entry_timeout_s", 5.0);
             auto_declare<double>("rl_entry_tolerance_rad", 0.25);
             auto_declare<double>("rl_entry_velocity_rad_s", 1.0);
