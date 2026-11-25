@@ -43,6 +43,7 @@ constexpr char kHybridFilteredOdometryId[] = "sysu219.pure_hybrid_gait75.filtere
 constexpr char kHybridFilteredOdometryContract[] = "40935967948bccd657c3cbdee7e6d9980e0d7d62d90ebadcdf581ac8dafce298";
 constexpr char kHybridXYHoldId[] = "sysu219.pure_hybrid_gait75.xy_hold.v1";
 constexpr char kHybridXYHoldContract[] = "e232761e259c78810a7a200f6783ba9d718c9f5fd6661cb222c9270e57cbe8aa";
+constexpr char kHybridXYHoldObservationTrialContract[] = "c44dc19c28718d283f2919867f77c85bd0fb8635c662d3ab4730513940ce8dca";
 constexpr char kFlatCheckpoint[] = "5d16c702b3bba579830968f16c85722dbb06d75e7f1b6efd922fef3010363228";
 constexpr char kFlatContract[] = "e0f63c48ba5536a61af412bffd122f650b3a18fed27b0f3210f9465d61c8d4ba";
 constexpr char kTrackingContract[] = "930d512bfd01635766017ffa1368a462b5c42879b034827256b82d815737dd65";
@@ -120,10 +121,11 @@ class PlanarOdometryHold {
 public:
     using Sample = std::array<float, 4>;  // x, y, vx, vy in the fixed entry-heading frame.
 
-    explicit PlanarOdometryHold(bool strongerLateralHold)
-        : positionGain_{0.35f, strongerLateralHold ? 2.50f : 0.35f},
-          positionDeadband_{0.015f, strongerLateralHold ? 0.01f : 0.015f},
-          trimLimit_{0.05f, strongerLateralHold ? 0.06f : 0.04f} {}
+    void configureLateral(float positionGain, float positionDeadband, float trimLimit) {
+        positionGain_[1] = positionGain;
+        positionDeadband_[1] = positionDeadband;
+        trimLimit_[1] = trimLimit;
+    }
 
     void reset() {
         seedPending_ = true;
@@ -178,9 +180,9 @@ private:
 
     inline static const float kFilterAlpha = static_cast<float>(-std::expm1(-kPeriod / 0.25));
     static constexpr float kMaxTrimStep = static_cast<float>(0.025 * kPeriod);
-    const std::array<float, 2> positionGain_;
-    const std::array<float, 2> positionDeadband_;
-    const std::array<float, 2> trimLimit_;
+    std::array<float, 2> positionGain_{0.35f, 0.35f};
+    std::array<float, 2> positionDeadband_{0.015f, 0.015f};
+    std::array<float, 2> trimLimit_{0.05f, 0.04f};
 
     Sample previous_{}, older_{}, filtered_{};
     std::array<Sample, 33> window_{};
@@ -233,8 +235,7 @@ struct FlatPpoTracker::Impl {
     double transition, entryTolerance, entrySpeed, maxDt;
 
     Impl(CtrlInterfaces& interfaces, Mode selected, const std::filesystem::path& path)
-        : io(interfaces), mode(selected), policy(policyFor(mode)),
-          planarHold(selected == Mode::HybridGait && path.filename() == "pure_hybrid_gait_key6.onnx") {
+        : io(interfaces), mode(selected), policy(policyFor(mode)) {
         if (!io.node) throw std::runtime_error("Missing ROS controller node");
         transition = checked(io.node->get_parameter("rl_pose_transition_s").as_double());
         entryTolerance = checked(io.node->get_parameter("rl_entry_tolerance_rad").as_double());
@@ -277,9 +278,11 @@ struct FlatPpoTracker::Impl {
         hybrid_velocity = mode == Mode::HybridGait && contract == kHybridVelocityGaitId;
         hybrid_xy_hold = mode == Mode::HybridGait && contract == kHybridXYHoldId;
         hybrid_filtered_odometry = hybrid_xy_hold || (mode == Mode::HybridGait && contract == kHybridFilteredOdometryId);
+        const bool lateralObservationTrial = hybrid_xy_hold && fingerprint == kHybridXYHoldObservationTrialContract;
         if (hybrid_filtered_odometry) {
             policy.id = hybrid_xy_hold ? kHybridXYHoldId : kHybridFilteredOdometryId;
             policy.fingerprint = hybrid_xy_hold ? kHybridXYHoldContract : kHybridFilteredOdometryContract;
+            if (lateralObservationTrial) policy.fingerprint = kHybridXYHoldObservationTrialContract;
             policy.width = kHybridFilteredOdometryWidth;
         } else if (hybrid_velocity) {
             policy.id = kHybridVelocityGaitId;
@@ -294,6 +297,11 @@ struct FlatPpoTracker::Impl {
             sha.size() != 64 || sha.find_first_not_of("0123456789abcdef") != std::string::npos ||
             (mode == Mode::FlatMpc && sha != kFlatCheckpoint))
             throw std::runtime_error("Wrong SYSU219 deployment contract or checkpoint");
+        if (lateralObservationTrial) {
+            planarHold.configureLateral(0.50f, 0.015f, 0.06f);
+        } else if (hybrid_xy_hold && path.filename() == "pure_hybrid_gait_key6.onnx") {
+            planarHold.configureLateral(2.50f, 0.01f, 0.06f);
+        }
         checkTensor(session->GetInputTypeInfo(0), policy.width);
         const std::array<int64_t, 2> inShape{1, policy.width}, outShape{1, 12};
         input = Ort::Value::CreateTensor<float>(memory, obs.data(), policy.width, inShape.data(), 2);

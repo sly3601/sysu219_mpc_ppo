@@ -1,6 +1,6 @@
 {
-  "checkpoint": "model_175.pt",
-  "checkpoint_sha256": "f40b357bfa65caf76bc6fa8827ec2c9e393535b7b0fd316c3ef0e8fadc8d93cb",
+  "checkpoint": "model_499.pt",
+  "checkpoint_sha256": "e0f70eebd02acb24053f8bcb585df04cd46498d3a4281a2da46de2789c4cf089",
   "contract": {
     "id": "sysu219.pure_hybrid_gait75.xy_hold.v1",
     "observation_width": 75,
@@ -38,7 +38,7 @@
     ],
     "command_abs_limits": [
       0.3,
-      0.04,
+      0.12,
       0.3
     ],
     "tracking_reference": [],
@@ -190,7 +190,7 @@
     },
     "operator_command_abs_limits": [
       0.3,
-      0.0,
+      0.12,
       0.3
     ],
     "odometry_hold_feedback": {
@@ -214,20 +214,27 @@
       "target_position": "latch the filtered position on entering zero command",
       "position_deadband_m": 0.015,
       "velocity_deadband_m_s": 0.008,
-      "position_gain_per_s": 0.35,
+      "position_gain_per_s": [
+        0.35,
+        0.5
+      ],
       "velocity_gain": 0.6,
       "trim_abs_limits_m_s": [
         0.05,
-        0.04
+        0.06
       ],
       "trim_slew_limit_m_s2": 0.025,
       "inactive_behavior": "slew trim toward zero",
-      "output": "rotate XY trim into current odometry heading, clamp lateral trim to 0.04 m/s, add to both actor command and local gait reference"
+      "output": "rotate XY trim into current odometry heading, clamp lateral trim to 0.06 m/s, add to both actor command and local gait reference"
     }
   },
-  "contract_sha256": "e232761e259c78810a7a200f6783ba9d718c9f5fd6661cb222c9270e57cbe8aa",
-  "onnx_sha256": "cfdfc2e1d4ff52b0e20c057ec3cafa4c14d261514e60ede00fc65bac3e08d274",
-  "onnx_reference_vs_torch_max_abs": 2.86102294921875e-06,
-  "run": "2026-11-24_18-57-54_key4_xy_odometry_hold",
+  "contract_sha256": "c44dc19c28718d283f2919867f77c85bd0fb8635c662d3ab4730513940ce8dca",
+  "onnx_sha256": "1a35f3fe00a9dd897e2b8c53586e28357c4088d77903407aa12d88b816d7a969",
+  "onnx_reference_vs_torch_max_abs": 1.3113021850585938e-06,
+  "run": "2026-11-25_10-12-06_key6_y_velocity_5x",
+  "folded_odometry_observation_scales": {
+    "y_position": 1.0,
+    "y_velocity": 5.0
+  },
   "keyboard_slot": 5
 }

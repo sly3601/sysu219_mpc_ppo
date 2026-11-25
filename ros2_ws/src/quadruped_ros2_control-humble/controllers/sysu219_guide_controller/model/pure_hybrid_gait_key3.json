@@ -1,8 +1,8 @@
 {
-  "checkpoint": "model_75.pt",
-  "checkpoint_sha256": "af4eccf392c49476ab952ffb99fedfa1fbb4f9c26fc23aa4b52e37c484843da7",
+  "checkpoint": "model_499.pt",
+  "checkpoint_sha256": "fa7601e2392c9990a7fc142398c8c67c9ad837acb9395a26d850e349bd9ad4bd",
   "contract": {
-    "id": "sysu219.pure_hybrid_gait75.filtered_odom.v1",
+    "id": "sysu219.pure_hybrid_gait75.xy_hold.v1",
     "observation_width": 75,
     "actor_joint_order": [
       "FL_hip_joint",
@@ -38,7 +38,7 @@
     ],
     "command_abs_limits": [
       0.3,
-      0.0,
+      0.12,
       0.3
     ],
     "tracking_reference": [],
@@ -187,11 +187,54 @@
       "tau_per_stage_s": 1.0,
       "update": "first-order low-pass; the second stage uses the updated first stage",
       "reset": "seed both stages from the first input at gait entry"
+    },
+    "operator_command_abs_limits": [
+      0.3,
+      0.12,
+      0.3
+    ],
+    "odometry_hold_feedback": {
+      "input_order": [
+        "x",
+        "y",
+        "vx",
+        "vy"
+      ],
+      "input_frame": "fixed entry odometry heading axes in XY",
+      "input_source": "InEKF before the separate two-stage actor observation filter",
+      "period_s": 0.02,
+      "median_window_samples": 3,
+      "average_window_s": 0.65,
+      "average_window_samples": 33,
+      "average_oldest_sample_weight": 0.5,
+      "average_weight_sum": 32.5,
+      "low_pass_tau_s": 0.25,
+      "filter_reset": "seed all filter history from the first motion sample",
+      "active_when": "all operator commands are zero",
+      "target_position": "latch the filtered position on entering zero command",
+      "position_deadband_m": 0.015,
+      "velocity_deadband_m_s": 0.008,
+      "position_gain_per_s": [
+        0.35,
+        0.5
+      ],
+      "velocity_gain": 0.6,
+      "trim_abs_limits_m_s": [
+        0.05,
+        0.06
+      ],
+      "trim_slew_limit_m_s2": 0.025,
+      "inactive_behavior": "slew trim toward zero",
+      "output": "rotate XY trim into current odometry heading, clamp lateral trim to 0.06 m/s, add to both actor command and local gait reference"
     }
   },
-  "contract_sha256": "40935967948bccd657c3cbdee7e6d9980e0d7d62d90ebadcdf581ac8dafce298",
-  "onnx_sha256": "ddf9cfd3e7a1f4f8f9974d44080ab74ca7c8b0fe0ac45ab8a0d26db77300f84f",
-  "onnx_reference_vs_torch_max_abs": 1.430511474609375e-06,
-  "run": "2026-11-24_17-04-48_key9_filtered_xy",
+  "contract_sha256": "c44dc19c28718d283f2919867f77c85bd0fb8635c662d3ab4730513940ce8dca",
+  "onnx_sha256": "fddc1bb882f69aef18ad59d4325e6d5fb679f2f148210b5cff8a33cdb52bcf34",
+  "onnx_reference_vs_torch_max_abs": 2.2649765014648438e-06,
+  "run": "2026-11-25_09-00-34_key6_no_y_position",
+  "folded_odometry_observation_scales": {
+    "y_position": 0.0,
+    "y_velocity": 1.0
+  },
   "keyboard_slot": 3
 }
