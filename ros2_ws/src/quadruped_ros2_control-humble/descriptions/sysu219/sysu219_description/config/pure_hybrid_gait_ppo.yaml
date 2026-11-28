@@ -12,8 +12,8 @@ sysu219_guide_controller:
     contact_shadow_inekf_enabled: false
     contact_shadow_write_csv: false
     # Keys 3, 4, 5 and 9 share zero-command forward hold. Kp uses position error, Kd damps InEKF velocity.
-    rl_key9_hold_kp: 25.0
-    rl_key9_hold_kd: 125.0
+    rl_key9_hold_kp: 1.0
+    rl_key9_hold_kd: 1.0
     rl_key9_hold_position_deadband_m: 0.01
     rl_key9_hold_max_trim_m_s: 0.30
     rl_key9_hold_position_cutoff_hz: 10.0
