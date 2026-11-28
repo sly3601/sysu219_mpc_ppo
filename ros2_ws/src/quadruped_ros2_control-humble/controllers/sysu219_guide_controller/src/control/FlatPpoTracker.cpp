@@ -376,14 +376,16 @@ struct FlatPpoTracker::Impl {
             (mode == Mode::FlatMpc && sha != kFlatCheckpoint))
             throw std::runtime_error("Wrong SYSU219 deployment contract or checkpoint");
         const auto modelName = path.filename().string();
-        const bool key3ForwardHold = hybrid_velocity_only && modelName == "pure_hybrid_gait_key3.onnx";
+        const bool velocityPolicyForwardHold = hybrid_velocity_only &&
+            (modelName == "pure_hybrid_gait_key3.onnx" || modelName == "pure_hybrid_gait_key4.onnx" ||
+             modelName == "pure_hybrid_gait_key5.onnx");
         const bool key9ForwardHold = equal_hybrid_phases && sha == kKey9Checkpoint &&
                                      modelName == "pure_hybrid_gait_key9.onnx";
         if (lateralObservationTrial) {
             planarHold.configureLateral(0.50f, 0.015f, 0.06f);
         } else if (hybrid_xy_hold && modelName == "pure_hybrid_gait_key6.onnx") {
             planarHold.configureLateral(2.50f, 0.01f, 0.06f);
-        } else if (key3ForwardHold || key9ForwardHold) {
+        } else if (velocityPolicyForwardHold || key9ForwardHold) {
             const PlanarOdometryHold::ForwardParameters hold{
                 static_cast<float>(io.node->get_parameter("rl_key9_hold_kp").as_double()),
                 static_cast<float>(io.node->get_parameter("rl_key9_hold_kd").as_double()),
