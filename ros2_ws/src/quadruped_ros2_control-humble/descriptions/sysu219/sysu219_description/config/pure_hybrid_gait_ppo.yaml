@@ -11,7 +11,7 @@ sysu219_guide_controller:
     contact_feedback_control: false
     contact_shadow_inekf_enabled: false
     contact_shadow_write_csv: false
-    # Key 9 zero-command forward hold. Kp multiplies position error, Kd damps measured InEKF velocity.
+    # Keys 3 and 9 share zero-command forward hold. Kp uses position error, Kd damps InEKF velocity.
     rl_key9_hold_kp: 25.0
     rl_key9_hold_kd: 125.0
     rl_key9_hold_position_deadband_m: 0.01

@@ -145,7 +145,7 @@ public:
             !std::isfinite(positionCutoffHz) || positionCutoffHz <= 0.f || positionCutoffHz >= nyquistHz ||
             !std::isfinite(velocityCutoffHz) || velocityCutoffHz <= 0.f || velocityCutoffHz >= nyquistHz ||
             !std::isfinite(trimSlew) || trimSlew <= 0.f)
-            throw std::runtime_error("Invalid key 9 forward hold parameters");
+            throw std::runtime_error("Invalid PPO forward hold parameters");
         const auto lowPassAlpha = [](double cutoffHz) {
             constexpr double pi = 3.14159265358979323846;
             const double sine = std::sin(pi * cutoffHz * kPeriod);
@@ -375,11 +375,15 @@ struct FlatPpoTracker::Impl {
             sha.size() != 64 || sha.find_first_not_of("0123456789abcdef") != std::string::npos ||
             (mode == Mode::FlatMpc && sha != kFlatCheckpoint))
             throw std::runtime_error("Wrong SYSU219 deployment contract or checkpoint");
+        const auto modelName = path.filename().string();
+        const bool key3ForwardHold = hybrid_velocity_only && modelName == "pure_hybrid_gait_key3.onnx";
+        const bool key9ForwardHold = equal_hybrid_phases && sha == kKey9Checkpoint &&
+                                     modelName == "pure_hybrid_gait_key9.onnx";
         if (lateralObservationTrial) {
             planarHold.configureLateral(0.50f, 0.015f, 0.06f);
-        } else if (hybrid_xy_hold && path.filename() == "pure_hybrid_gait_key6.onnx") {
+        } else if (hybrid_xy_hold && modelName == "pure_hybrid_gait_key6.onnx") {
             planarHold.configureLateral(2.50f, 0.01f, 0.06f);
-        } else if (equal_hybrid_phases && sha == kKey9Checkpoint && path.filename() == "pure_hybrid_gait_key9.onnx") {
+        } else if (key3ForwardHold || key9ForwardHold) {
             const PlanarOdometryHold::ForwardParameters hold{
                 static_cast<float>(io.node->get_parameter("rl_key9_hold_kp").as_double()),
                 static_cast<float>(io.node->get_parameter("rl_key9_hold_kd").as_double()),
@@ -390,9 +394,9 @@ struct FlatPpoTracker::Impl {
                 static_cast<float>(io.node->get_parameter("rl_key9_hold_trim_slew_m_s2").as_double())};
             planarHold.configureForward(hold);
             RCLCPP_INFO(io.node->get_logger(),
-                        "Key 9 forward hold: Kp=%.3f Kd=%.3f deadband=%.3f m trim=%.3f m/s "
+                        "%s forward hold: Kp=%.3f Kd=%.3f deadband=%.3f m trim=%.3f m/s "
                         "pos_cutoff=%.1f Hz vel_cutoff=%.1f Hz slew=%.3f m/s^2",
-                        hold.kp, hold.kd, hold.positionDeadband, hold.trimLimit,
+                        modelName.c_str(), hold.kp, hold.kd, hold.positionDeadband, hold.trimLimit,
                         hold.positionCutoffHz, hold.velocityCutoffHz, hold.trimSlew);
         }
         checkTensor(session->GetInputTypeInfo(0), policy.width);
@@ -427,7 +431,9 @@ struct FlatPpoTracker::Impl {
                 !std::isfinite(measurement->yaw_rate_w))
                 throw std::runtime_error("Invalid estimated state for smooth PPO");
         }
+        const bool forwardHold = planarHold.usesForwardHold();
         if (mode == Mode::HybridGait && (!hybrid || (!hybrid_velocity_only && !hybrid->position.allFinite()) ||
+                (forwardHold && !hybrid->position.head<2>().allFinite()) ||
                 ((hybrid_velocity || hybrid_velocity_only) && !hybrid->velocity.allFinite()) ||
                 (hybrid_filtered_odometry && !hybrid->velocity.head<2>().allFinite()) ||
                 !std::isfinite(hybrid->yaw) || hybrid->elapsed_ns < 0 ||
@@ -535,23 +541,26 @@ struct FlatPpoTracker::Impl {
             const auto next = hybrid->wave.sampleSynchronizedTrot(hybrid->elapsed_ns + kPolicyPeriodNs);
             const double interval = started
                 ? (hybrid->elapsed_ns - previousHybridPolicyNs) * kSecondsPerNanosecond : kPeriod;
-            if (!hybrid_velocity_only) {
+            if (!hybrid_velocity_only || forwardHold) {
                 if (!started) {
                     hybridPositionOrigin = hybrid->position;
                     hybridEntryYaw = hybrid->yaw;
                     hybridHeading << std::cos(hybrid->yaw), std::sin(hybrid->yaw);
                 }
                 const Eigen::Vector3d delta = hybrid->position - hybridPositionOrigin;
-                obs[kLocalGaitWidth] = static_cast<float>(hybridHeading.dot(delta.head<2>()));
-                obs[kLocalGaitWidth + 1] = static_cast<float>(-hybridHeading.y() * delta.x() + hybridHeading.x() * delta.y());
-                if (!hybrid_filtered_odometry) obs[kLocalGaitWidth + 2] = static_cast<float>(delta.z());
-                const bool forwardHold = planarHold.usesForwardHold();
+                const float x = static_cast<float>(hybridHeading.dot(delta.head<2>()));
+                const float y = static_cast<float>(-hybridHeading.y() * delta.x() + hybridHeading.x() * delta.y());
+                if (!hybrid_velocity_only) {
+                    obs[kLocalGaitWidth] = x;
+                    obs[kLocalGaitWidth + 1] = y;
+                    if (!hybrid_filtered_odometry) obs[kLocalGaitWidth + 2] = static_cast<float>(delta.z());
+                }
                 if (hybrid_filtered_odometry || forwardHold) {
                     Eigen::Vector2d v = hybrid->velocity.head<2>();
                     if (!v.allFinite()) v.setZero();
                     // The training filter sees both XY vectors in the same fixed entry-yaw frame.
                     const PlanarOdometryHold::Sample measurement{
-                        obs[kLocalGaitWidth], obs[kLocalGaitWidth + 1],
+                        x, y,
                         static_cast<float>(hybridHeading.dot(v)),
                         static_cast<float>(-hybridHeading.y() * v.x() + hybridHeading.x() * v.y())};
                     if ((hybrid_xy_hold || forwardHold) && started) {
