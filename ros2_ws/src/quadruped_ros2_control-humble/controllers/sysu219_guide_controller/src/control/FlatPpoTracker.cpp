@@ -25,6 +25,7 @@ constexpr double kSecondsPerNanosecond = 1.0e-9;
 constexpr double kTargetTimeConstant = 0.010;
 constexpr double kHybridOdometryTimeConstant = 1.0;
 const float kHybridOdometryAlpha = static_cast<float>(-std::expm1(-kPeriod / kHybridOdometryTimeConstant));
+constexpr float kHybridVelocityOnlyAlpha = 0.6726238018f;  // 10 Hz digital cutoff at 50 Hz.
 constexpr std::array<const char*, 4> kLegs{"FL", "FR", "RL", "RR"};  // Isaac articulation order
 constexpr std::array<const char*, 3> kKinds{"hip", "thigh", "calf"};
 constexpr std::array<double, 3> kPose{0., 0.67, -1.30}, kKp{285., 265., 265.};
@@ -40,6 +41,8 @@ constexpr char kDiagonalHybridGaitContract[] = "3320576f27f15e63d83b01b13b0f743e
 constexpr char kHybridVelocityGaitId[] = "sysu219.pure_hybrid_gait77.v1";
 constexpr char kHybridVelocityGaitContract[] = "9f517ad3d0bf8e566e2d365d17c1a3a455db3c4c644ad8711d7eedbb0403c055";
 constexpr char kDiagonalHybridVelocityGaitContract[] = "4e59ccf367ca6e9de22f18127448059f482187b8da137e26ea765398bc2b61bc";
+constexpr char kHybridVelocityOnlyId[] = "sysu219.pure_hybrid_gait74.velocity_odom.v1";
+constexpr char kHybridVelocityOnlyContract[] = "52c68f5e7fba8c69ff1140794f2bac13e23cdca91c81ff0f112e4dbf4e0e644d";
 constexpr char kHybridFilteredOdometryId[] = "sysu219.pure_hybrid_gait75.filtered_odom.v1";
 constexpr char kHybridFilteredOdometryContract[] = "40935967948bccd657c3cbdee7e6d9980e0d7d62d90ebadcdf581ac8dafce298";
 constexpr char kHybridXYHoldId[] = "sysu219.pure_hybrid_gait75.xy_hold.v1";
@@ -291,7 +294,7 @@ struct FlatPpoTracker::Impl {
     Ort::Value input{nullptr}, output{nullptr};
     bool started = false, fault = false, inferred = false;
     bool equal_hybrid_phases = false, hybrid_velocity = false, hybrid_filtered_odometry = false;
-    bool hybrid_xy_hold = false;
+    bool hybrid_xy_hold = false, hybrid_velocity_only = false;
     double elapsed = 0., sinceInference = 0., blend = 0.;
     double sinceHostTick = 0.;
     std::int64_t nextHybridPolicyNs = 0, previousHybridPolicyNs = 0;
@@ -300,6 +303,7 @@ struct FlatPpoTracker::Impl {
     Eigen::Vector2d hybridHeading = Eigen::Vector2d::UnitX();
     double hybridEntryYaw = 0.;
     std::array<float, 4> hybridOdometryFirstPole{}, hybridOdometrySecondPole{};
+    std::array<float, 3> hybridFilteredVelocity{};
     PlanarOdometryHold planarHold;
     double transition, entryTolerance, entrySpeed, maxDt;
 
@@ -345,6 +349,7 @@ struct FlatPpoTracker::Impl {
         const auto fingerprint = metadata(meta, "sysu219.contract_sha256");
         const auto contract = metadata(meta, "sysu219.contract_id");
         hybrid_velocity = mode == Mode::HybridGait && contract == kHybridVelocityGaitId;
+        hybrid_velocity_only = mode == Mode::HybridGait && contract == kHybridVelocityOnlyId;
         hybrid_xy_hold = mode == Mode::HybridGait && contract == kHybridXYHoldId;
         hybrid_filtered_odometry = hybrid_xy_hold || (mode == Mode::HybridGait && contract == kHybridFilteredOdometryId);
         const bool lateralObservationTrial = hybrid_xy_hold && fingerprint == kHybridXYHoldObservationTrialContract;
@@ -353,12 +358,16 @@ struct FlatPpoTracker::Impl {
             policy.fingerprint = hybrid_xy_hold ? kHybridXYHoldContract : kHybridFilteredOdometryContract;
             if (lateralObservationTrial) policy.fingerprint = kHybridXYHoldObservationTrialContract;
             policy.width = kHybridFilteredOdometryWidth;
+        } else if (hybrid_velocity_only) {
+            policy.id = kHybridVelocityOnlyId;
+            policy.fingerprint = kHybridVelocityOnlyContract;
+            policy.width = kLocalGaitWidth + 3;
         } else if (hybrid_velocity) {
             policy.id = kHybridVelocityGaitId;
             policy.fingerprint = kHybridVelocityGaitContract;
             policy.width = kHybridVelocityWidth;
         }
-        const auto diagonal_fingerprint = hybrid_filtered_odometry ? policy.fingerprint
+        const auto diagonal_fingerprint = (hybrid_filtered_odometry || hybrid_velocity_only) ? policy.fingerprint
             : hybrid_velocity ? kDiagonalHybridVelocityGaitContract : kDiagonalHybridGaitContract;
         equal_hybrid_phases = mode == Mode::HybridGait && fingerprint == diagonal_fingerprint;
         if (contract != policy.id ||
@@ -418,8 +427,8 @@ struct FlatPpoTracker::Impl {
                 !std::isfinite(measurement->yaw_rate_w))
                 throw std::runtime_error("Invalid estimated state for smooth PPO");
         }
-        if (mode == Mode::HybridGait && (!hybrid || !hybrid->position.allFinite() ||
-                (hybrid_velocity && !hybrid->velocity.allFinite()) ||
+        if (mode == Mode::HybridGait && (!hybrid || (!hybrid_velocity_only && !hybrid->position.allFinite()) ||
+                ((hybrid_velocity || hybrid_velocity_only) && !hybrid->velocity.allFinite()) ||
                 (hybrid_filtered_odometry && !hybrid->velocity.head<2>().allFinite()) ||
                 !std::isfinite(hybrid->yaw) || hybrid->elapsed_ns < 0 ||
                 (!started && hybrid->elapsed_ns != 0) ||
@@ -526,56 +535,68 @@ struct FlatPpoTracker::Impl {
             const auto next = hybrid->wave.sampleSynchronizedTrot(hybrid->elapsed_ns + kPolicyPeriodNs);
             const double interval = started
                 ? (hybrid->elapsed_ns - previousHybridPolicyNs) * kSecondsPerNanosecond : kPeriod;
-            if (!started) {
-                hybridPositionOrigin = hybrid->position;
-                hybridEntryYaw = hybrid->yaw;
-                hybridHeading << std::cos(hybrid->yaw), std::sin(hybrid->yaw);
-            }
-            const Eigen::Vector3d delta = hybrid->position - hybridPositionOrigin;
-            obs[kLocalGaitWidth] = static_cast<float>(hybridHeading.dot(delta.head<2>()));
-            obs[kLocalGaitWidth + 1] = static_cast<float>(-hybridHeading.y() * delta.x() + hybridHeading.x() * delta.y());
-            const bool forwardHold = planarHold.usesForwardHold();
-            if (hybrid_filtered_odometry || forwardHold) {
-                Eigen::Vector2d v = hybrid->velocity.head<2>();
-                if (!v.allFinite()) v.setZero();
-                // The training filter sees both XY vectors in the same fixed entry-yaw frame.
-                const PlanarOdometryHold::Sample measurement{
-                    obs[kLocalGaitWidth], obs[kLocalGaitWidth + 1],
-                    static_cast<float>(hybridHeading.dot(v)),
-                    static_cast<float>(-hybridHeading.y() * v.x() + hybridHeading.x() * v.y())};
-                if ((hybrid_xy_hold || forwardHold) && started) {
-                    for (const float value : measurement) checked(value);
-                    const bool idle = (cmd.array() == 0.).all() && (!forwardHold || elapsed >= transition);
-                    const auto trim = planarHold.advance(measurement, idle, hybrid->yaw - hybridEntryYaw);
-                    if (!lateralCommand) bounded.head<2>() += trim;
-                    bounded.x() = std::clamp(bounded.x(), -0.3, 0.3);
-                    obs[feedbackOffset + 6] = static_cast<float>(bounded.x());
-                    obs[feedbackOffset + 7] = static_cast<float>(bounded.y());
+            if (!hybrid_velocity_only) {
+                if (!started) {
+                    hybridPositionOrigin = hybrid->position;
+                    hybridEntryYaw = hybrid->yaw;
+                    hybridHeading << std::cos(hybrid->yaw), std::sin(hybrid->yaw);
                 }
-                if (hybrid_filtered_odometry) {
-                    if (!started) {
-                        hybridOdometryFirstPole = hybridOdometrySecondPole = measurement;
-                    } else {
-                        for (std::size_t i = 0; i < measurement.size(); ++i) {
-                            auto& first = hybridOdometryFirstPole[i];
-                            auto& second = hybridOdometrySecondPole[i];
-                            first += kHybridOdometryAlpha * (measurement[i] - first);
-                            second += kHybridOdometryAlpha * (first - second);
-                        }
+                const Eigen::Vector3d delta = hybrid->position - hybridPositionOrigin;
+                obs[kLocalGaitWidth] = static_cast<float>(hybridHeading.dot(delta.head<2>()));
+                obs[kLocalGaitWidth + 1] = static_cast<float>(-hybridHeading.y() * delta.x() + hybridHeading.x() * delta.y());
+                if (!hybrid_filtered_odometry) obs[kLocalGaitWidth + 2] = static_cast<float>(delta.z());
+                const bool forwardHold = planarHold.usesForwardHold();
+                if (hybrid_filtered_odometry || forwardHold) {
+                    Eigen::Vector2d v = hybrid->velocity.head<2>();
+                    if (!v.allFinite()) v.setZero();
+                    // The training filter sees both XY vectors in the same fixed entry-yaw frame.
+                    const PlanarOdometryHold::Sample measurement{
+                        obs[kLocalGaitWidth], obs[kLocalGaitWidth + 1],
+                        static_cast<float>(hybridHeading.dot(v)),
+                        static_cast<float>(-hybridHeading.y() * v.x() + hybridHeading.x() * v.y())};
+                    if ((hybrid_xy_hold || forwardHold) && started) {
+                        for (const float value : measurement) checked(value);
+                        const bool idle = (cmd.array() == 0.).all() && (!forwardHold || elapsed >= transition);
+                        const auto trim = planarHold.advance(measurement, idle, hybrid->yaw - hybridEntryYaw);
+                        if (!lateralCommand) bounded.head<2>() += trim;
+                        bounded.x() = std::clamp(bounded.x(), -0.3, 0.3);
+                        obs[feedbackOffset + 6] = static_cast<float>(bounded.x());
+                        obs[feedbackOffset + 7] = static_cast<float>(bounded.y());
                     }
-                    std::copy(hybridOdometrySecondPole.begin(), hybridOdometrySecondPole.end(), obs.begin() + kLocalGaitWidth);
+                    if (hybrid_filtered_odometry) {
+                        if (!started) {
+                            hybridOdometryFirstPole = hybridOdometrySecondPole = measurement;
+                        } else {
+                            for (std::size_t i = 0; i < measurement.size(); ++i) {
+                                auto& first = hybridOdometryFirstPole[i];
+                                auto& second = hybridOdometrySecondPole[i];
+                                first += kHybridOdometryAlpha * (measurement[i] - first);
+                                second += kHybridOdometryAlpha * (first - second);
+                            }
+                        }
+                        std::copy(hybridOdometrySecondPole.begin(), hybridOdometrySecondPole.end(), obs.begin() + kLocalGaitWidth);
+                    }
                 }
             }
-            if (!hybrid_filtered_odometry) {
-                obs[kLocalGaitWidth + 2] = static_cast<float>(delta.z());
-            }
-            if (hybrid_velocity) {
+            if (hybrid_velocity || hybrid_velocity_only) {
                 // Match the actor's current odometry heading frame for XY and world Z.
                 const double c = std::cos(hybrid->yaw), s = std::sin(hybrid->yaw);
                 const auto& v = hybrid->velocity;
-                obs[kHybridPositionWidth] = static_cast<float>(c * v.x() + s * v.y());
-                obs[kHybridPositionWidth + 1] = static_cast<float>(-s * v.x() + c * v.y());
-                obs[kHybridPositionWidth + 2] = static_cast<float>(v.z());
+                const std::array<float, 3> measured{
+                    static_cast<float>(c * v.x() + s * v.y()),
+                    static_cast<float>(-s * v.x() + c * v.y()),
+                    static_cast<float>(v.z())};
+                if (hybrid_velocity_only) {
+                    if (!started) {
+                        hybridFilteredVelocity = measured;
+                    } else {
+                        for (std::size_t i = 0; i < measured.size(); ++i)
+                            hybridFilteredVelocity[i] += kHybridVelocityOnlyAlpha * (measured[i] - hybridFilteredVelocity[i]);
+                    }
+                    std::copy(hybridFilteredVelocity.begin(), hybridFilteredVelocity.end(), obs.begin() + kLocalGaitWidth);
+                } else {
+                    std::copy(measured.begin(), measured.end(), obs.begin() + kHybridPositionWidth);
+                }
             }
             const auto reference = localReference.stepSynchronized(bounded, current.cycle, next.contact, next.phase,
                 interval, hybrid->wave.get_t_stance(), hybrid->wave.get_t_swing());
@@ -681,6 +702,7 @@ void FlatPpoTracker::reset() {
     impl_->localReference.reset();
     impl_->hybridOdometryFirstPole.fill(0.f);
     impl_->hybridOdometrySecondPole.fill(0.f);
+    impl_->hybridFilteredVelocity.fill(0.f);
     impl_->planarHold.reset();
     impl_->raw.fill(0.f);
 }
